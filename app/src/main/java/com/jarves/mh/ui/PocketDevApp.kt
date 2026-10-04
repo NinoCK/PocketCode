@@ -428,6 +428,9 @@ fun PocketDevApp(viewModel: MainViewModel = viewModel()) {
                 onExtractZip = viewModel::extractZipIntoWorkspace,
                 onImportZipProject = viewModel::importZipProject,
                 onBuildAndRunAndroid = viewModel::buildAndRunAndroidApp,
+                onStartPreview = viewModel::startPreview,
+                onStopPreview = viewModel::stopPreview,
+                onPreviewOpened = viewModel::refreshPreviewCommand,
                 fileActions = remember(viewModel) {
                     FileManagerActions(
                         onEditFile = viewModel::editFile,

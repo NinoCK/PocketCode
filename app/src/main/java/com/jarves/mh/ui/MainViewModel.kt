@@ -60,6 +60,13 @@ import com.jarves.mh.runtime.AntigravityRuntimeBridge
 import com.jarves.mh.runtime.ClaudeAuthController
 import com.jarves.mh.runtime.ClaudeAuthState
 import com.jarves.mh.runtime.NativeSpawnProcess
+import com.jarves.mh.runtime.PocketMcpServer
+import com.jarves.mh.runtime.PocketTool
+import com.jarves.mh.runtime.PocketToolResult
+import com.jarves.mh.runtime.PreviewServerManager
+import com.jarves.mh.runtime.PreviewServerState
+import com.jarves.mh.runtime.PreviewServerStatus
+import com.jarves.mh.runtime.detectPreviewUrl
 import com.jarves.mh.runtime.RuntimeInstallProgress
 import com.jarves.mh.runtime.RuntimeInstaller
 import com.jarves.mh.runtime.RuntimeSetupController
@@ -251,6 +258,10 @@ data class AppUiState(
     val workSegmentStartedAtMillis: Long? = null,
     val previewReady: Boolean = false,
     val previewUrl: String? = null,
+    /** The app-run dev server; it may belong to a project other than the open one. */
+    val previewServer: PreviewServerState = PreviewServerState(),
+    /** Command offered for starting the open project's preview. */
+    val previewCommand: String? = null,
     val isRunning: Boolean = false,
     val activeSessionId: String? = null,
     val toastMessage: String? = null,
@@ -327,8 +338,13 @@ data class AppUiState(
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val vault = ApiKeyVault(application)
     private val preferences = AppPreferences(application)
+    private val previewServer = PreviewServerManager(application, viewModelScope)
+    private val pocketMcp = PocketMcpServer(pocketTools(), BuildConfig.VERSION_NAME).also { server ->
+        runCatching { server.start() }.onFailure { android.util.Log.w("MainViewModel", "Built-in MCP server unavailable", it) }
+    }
     private val claudeRuntime = ClaudeRuntimeBridge(
         application,
+        pocketMcpConfig = { pocketMcp.claudeMcpConfig() },
         effort = { _state.value.claudeEffort },
         controls = { _state.value.claudeControls },
     ) { profile ->
@@ -436,6 +452,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         viewModelScope.launch { dshRuntime.events.collect(::onRuntimeEvent) }
+        viewModelScope.launch { previewServer.state.collect(::onPreviewServerState) }
         viewModelScope.launch { antigravityRuntime.events.collect(::onRuntimeEvent) }
         viewModelScope.launch {
             antigravityAuthController.state.collect { auth ->
@@ -669,6 +686,137 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(pendingTerminalCommand = null) }
     }
 
+    /** Refreshes the command offered in the Preview tab from the project's files. */
+    fun refreshPreviewCommand() {
+        val project = _state.value.activeProject ?: return
+        viewModelScope.launch {
+            val command = withContext(Dispatchers.IO) {
+                runCatching { previewServer.suggestCommand(project.id, projectWorkspaceRoot(project)) }.getOrNull()
+            }
+            _state.update { if (it.activeProject?.id == project.id) it.copy(previewCommand = command) else it }
+        }
+    }
+
+    /** Starts the open project's dev server for the Preview tab, replacing any running one. */
+    fun startPreview(command: String) {
+        val project = _state.value.activeProject ?: return
+        val trimmed = command.trim()
+        if (trimmed.isBlank()) return
+        _state.update { it.copy(previewCommand = trimmed) }
+        viewModelScope.launch(Dispatchers.IO) {
+            previewServer.start(project.id, projectWorkspaceRoot(project), projectGuestRoot(project), trimmed)
+        }
+    }
+
+    fun stopPreview() {
+        viewModelScope.launch(Dispatchers.IO) { previewServer.stop() }
+    }
+
+    private fun onPreviewServerState(server: PreviewServerState) {
+        _state.update { current ->
+            val becameReady = server.status == PreviewServerStatus.RUNNING &&
+                current.previewServer.status != PreviewServerStatus.RUNNING
+            val ownsPreview = server.projectId != null && server.projectId == current.activeProject?.id
+            if (!ownsPreview || !becameReady || server.url == null) return@update current.copy(previewServer = server)
+            val item = ActivityItem("Preview ready", server.url)
+            current.copy(
+                previewServer = server,
+                previewReady = true,
+                previewUrl = server.url,
+                activity = listOf(item) + current.activity,
+                liveProcess = if (current.isRunning) current.liveProcess + item else current.liveProcess,
+            )
+        }
+    }
+
+    /** Tools agents can call through the built-in MCP server; they act on the open project. */
+    private fun pocketTools(): List<PocketTool> = listOf(
+        PocketTool(
+            name = "preview_start",
+            description = "Start (or restart) the open project's web dev server and show it in the PocketCode Preview tab. " +
+                "The server keeps running after your turn ends. Without a command, PocketCode picks one from the project " +
+                "(package.json dev/start script, Django, or a static index.html). The server must listen on localhost/127.0.0.1. " +
+                "Waits until the server prints a local URL, then returns its status and recent output.",
+            inputSchema = JSONObject()
+                .put("type", "object")
+                .put(
+                    "properties",
+                    JSONObject()
+                        .put(
+                            "command",
+                            JSONObject().put("type", "string").put(
+                                "description",
+                                "Shell command run from the project root, e.g. `npm run dev` or `python3 -m http.server 8000 --bind 127.0.0.1`.",
+                            ),
+                        )
+                        .put(
+                            "wait_seconds",
+                            JSONObject().put("type", "integer").put("description", "How long to wait for the server to come up (default 90, max 300)."),
+                        ),
+                ),
+            call = { arguments ->
+                val project = _state.value.activeProject
+                    ?: return@PocketTool PocketToolResult("No project is open in PocketCode.", isError = true)
+                val workspace = projectWorkspaceRoot(project)
+                val command = arguments.optString("command").trim().ifBlank { null }
+                    ?: previewServer.suggestCommand(project.id, workspace)
+                    ?: return@PocketTool PocketToolResult(
+                        "Could not tell how to serve this project. Call preview_start again with a `command`.",
+                        isError = true,
+                    )
+                val running = previewServer.state.value
+                if (running.active && running.projectId == project.id && running.command == command) {
+                    // Already serving this command; restarting would only drop the page.
+                    return@PocketTool PocketToolResult(describePreview(previewServer.awaitSettled(5_000)))
+                }
+                _state.update { if (it.activeProject?.id == project.id) it.copy(previewCommand = command) else it }
+                previewServer.start(project.id, workspace, projectGuestRoot(project), command)
+                val waitSeconds = arguments.optInt("wait_seconds", 90).coerceIn(5, 300)
+                val settled = previewServer.awaitSettled(waitSeconds * 1_000L)
+                PocketToolResult(describePreview(settled), isError = settled.status == PreviewServerStatus.FAILED)
+            },
+        ),
+        PocketTool(
+            name = "preview_status",
+            description = "Report the PocketCode preview server's status, URL, command and recent output.",
+            inputSchema = JSONObject().put("type", "object").put("properties", JSONObject()),
+            call = { PocketToolResult(describePreview(previewServer.state.value)) },
+        ),
+        PocketTool(
+            name = "preview_stop",
+            description = "Stop the PocketCode preview server.",
+            inputSchema = JSONObject().put("type", "object").put("properties", JSONObject()),
+            call = {
+                previewServer.stop()
+                PocketToolResult("Preview server stopped.")
+            },
+        ),
+    )
+
+    private fun describePreview(server: PreviewServerState): String = buildString {
+        val status = when (server.status) {
+            PreviewServerStatus.IDLE -> "not started"
+            PreviewServerStatus.STARTING -> "starting (no local URL printed yet; check again with preview_status)"
+            PreviewServerStatus.RUNNING -> "running"
+            PreviewServerStatus.FAILED -> "failed" + (server.exitCode?.let { " (exit code $it)" } ?: "")
+            PreviewServerStatus.STOPPED -> "stopped"
+        }
+        appendLine("Status: $status")
+        server.url?.takeIf { server.active }?.let { appendLine("URL: $it (shown in the PocketCode Preview tab)") }
+        server.command?.let { appendLine("Command: $it") }
+        val recent = server.log.lines().takeLast(40).joinToString("\n").trim()
+        if (recent.isNotEmpty()) {
+            appendLine("Recent output:")
+            append(recent)
+        }
+    }
+
+    override fun onCleared() {
+        previewServer.stop()
+        pocketMcp.close()
+        super.onCleared()
+    }
+
     private fun runProjectTerminalCommand(command: String) {
         val project = _state.value.activeProject ?: return
         if (_state.value.projectTerminalRunning) return
@@ -878,15 +1026,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             "rm -rf", "rm -fr", "git reset --hard", "git clean -f", "git push --force",
             "mkfs", "dd if=", "chmod -r 777", "shutdown", "reboot", ":(){", "kill \$(pgrep", "pkill -f",
         ).any(normalized::contains) || Regex("(curl|wget).*(\\||>)\\s*(sh|bash)").containsMatchIn(normalized)
-    }
-
-    private fun detectPreviewUrl(output: String): String? {
-        val match = Regex("https?://(?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0):(\\d{2,5})(?:/[^\\s]*)?")
-            .findAll(output)
-            .lastOrNull()
-            ?: return null
-        val port = match.groupValues[1].toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
-        return "http://127.0.0.1:$port/"
     }
 
     private fun detectServerUrl(command: String): String? {
@@ -2097,9 +2236,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 suggestedProjectRoot = suggestedRoot,
                 previewReady = false,
                 previewUrl = null,
+                previewCommand = null,
                 pendingAttachments = emptyList(),
             )
         }
+        // One preview server runs at a time; a server left by another project stops.
+        if (previewServer.state.value.projectId != project.id) previewServer.stop()
+        refreshPreviewCommand()
         refreshProjectFiles()
         _state.update { it.copy(claudeCapabilities = com.jarves.mh.runtime.ClaudeCapabilities()) }
         refreshClaudeCapabilities()

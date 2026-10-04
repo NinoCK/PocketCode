@@ -42,6 +42,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
@@ -167,6 +168,8 @@ import com.jarves.mh.model.ProjectChat
 import com.jarves.mh.model.ProviderKind
 import com.jarves.mh.model.ToolRequest
 import com.jarves.mh.model.WorkspaceEntry
+import com.jarves.mh.runtime.PreviewServerState
+import com.jarves.mh.runtime.PreviewServerStatus
 import com.jarves.mh.ui.theme.LocalPocketExtraColors
 import java.io.ByteArrayInputStream
 import kotlinx.coroutines.delay
@@ -234,6 +237,9 @@ internal fun WorkspaceScreen(
     onExtractZip: (Uri, String, Boolean) -> Unit,
     onImportZipProject: (Uri) -> Unit,
     onBuildAndRunAndroid: () -> Unit,
+    onStartPreview: (String) -> Unit = {},
+    onStopPreview: () -> Unit = {},
+    onPreviewOpened: () -> Unit = {},
     fileActions: FileManagerActions = FileManagerActions(),
     initialTab: WorkspaceTab = WorkspaceTab.CHAT,
 ) {
@@ -609,7 +615,15 @@ internal fun WorkspaceScreen(
                         compactHeader = true,
                     )
                     WorkspaceTab.CHANGES -> ChangesTab(state.changes, onUndoChanges, onKeepChanges, onUndoFileChange, onKeepFileChange)
-                    WorkspaceTab.PREVIEW -> PreviewTab(state.previewReady, state.previewUrl)
+                    WorkspaceTab.PREVIEW -> PreviewTab(
+                        ready = state.previewReady,
+                        url = state.previewUrl,
+                        server = state.previewServer.takeIf { it.projectId != null && it.projectId == state.activeProject?.id },
+                        suggestedCommand = state.previewCommand,
+                        onStart = onStartPreview,
+                        onStop = onStopPreview,
+                        onOpened = onPreviewOpened,
+                    )
                 }
             }
         }
@@ -1514,13 +1528,26 @@ private fun DiffLineRow(line: DiffLine) {
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-private fun PreviewTab(ready: Boolean, url: String?) {
-    var address by rememberSaveable(url) { mutableStateOf(if (ready) url.orEmpty() else "") }
-    var activeUrl by rememberSaveable(url) { mutableStateOf(if (ready) url else null) }
+private fun PreviewTab(
+    ready: Boolean,
+    url: String?,
+    server: PreviewServerState?,
+    suggestedCommand: String?,
+    onStart: (String) -> Unit,
+    onStop: () -> Unit,
+    onOpened: () -> Unit,
+) {
+    val serverUrl = server?.url?.takeIf { server.status == PreviewServerStatus.RUNNING }
+    val detectedUrl = serverUrl ?: url.takeIf { ready }
+    var address by rememberSaveable(detectedUrl) { mutableStateOf(detectedUrl.orEmpty()) }
+    var activeUrl by rememberSaveable(detectedUrl) { mutableStateOf(detectedUrl) }
     var addressError by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(false) }
     var webView by remember { mutableStateOf<WebView?>(null) }
+    var command by rememberSaveable(suggestedCommand) { mutableStateOf(suggestedCommand.orEmpty()) }
+    val serverActive = server?.active == true
 
+    LaunchedEffect(Unit) { onOpened() }
     val navigate = {
         val normalized = normalizePreviewUrl(address)
         if (normalized == null) {
@@ -1531,13 +1558,17 @@ private fun PreviewTab(ready: Boolean, url: String?) {
             activeUrl = normalized
         }
     }
-    LaunchedEffect(ready, url) {
-        if (ready && !url.isNullOrBlank() && activeUrl == null) {
-            normalizePreviewUrl(url)?.let {
+    LaunchedEffect(detectedUrl) {
+        if (!detectedUrl.isNullOrBlank() && activeUrl == null) {
+            normalizePreviewUrl(detectedUrl)?.let {
                 address = it
                 activeUrl = it
             }
         }
+    }
+    // The page goes away with the server that served it.
+    LaunchedEffect(server?.status) {
+        if (server != null && !server.active && server.url != null && activeUrl == server.url) activeUrl = null
     }
 
     Column(Modifier.fillMaxSize()) {
@@ -1571,6 +1602,17 @@ private fun PreviewTab(ready: Boolean, url: String?) {
                 keyboardActions = KeyboardActions(onGo = { navigate() }),
             )
             Spacer(Modifier.width(4.dp))
+            if (serverActive) {
+                FilledTonalIconButton(onClick = onStop, shapes = IconButtonDefaults.shapes()) {
+                    Icon(Icons.Rounded.Stop, "Stop preview server")
+                }
+            } else {
+                FilledTonalIconButton(
+                    onClick = { onStart(command) },
+                    enabled = command.isNotBlank(),
+                    shapes = IconButtonDefaults.shapes(),
+                ) { Icon(Icons.Rounded.PlayArrow, "Start preview server") }
+            }
             FilledTonalIconButton(
                 onClick = { webView?.reload() ?: navigate() },
                 enabled = address.isNotBlank(),
@@ -1591,11 +1633,12 @@ private fun PreviewTab(ready: Boolean, url: String?) {
         }
         val targetUrl = activeUrl
         if (targetUrl == null) {
-            ExpressiveEmptyState(
-                Icons.Rounded.Preview,
-                "Preview not running",
-                "Enter a localhost URL above, or start a local web server in the project terminal.",
-                polygon = MaterialShapes.Arch,
+            PreviewServerPanel(
+                server = server,
+                command = command,
+                onCommandChange = { command = it },
+                onStart = { onStart(command) },
+                onStop = onStop,
             )
         } else {
             Surface(
@@ -1644,6 +1687,82 @@ private fun PreviewTab(ready: Boolean, url: String?) {
     }
 }
 
+/** Shown while no page is open: start the dev server, or watch it come up. */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun PreviewServerPanel(
+    server: PreviewServerState?,
+    command: String,
+    onCommandChange: (String) -> Unit,
+    onStart: () -> Unit,
+    onStop: () -> Unit,
+) {
+    val starting = server?.status == PreviewServerStatus.STARTING
+    val failed = server?.status == PreviewServerStatus.FAILED
+    val (title, body) = when {
+        starting -> "Starting preview…" to "Waiting for the server to print a local URL."
+        failed -> "Preview server stopped" to (server?.exitCode?.let { "The command exited with code $it." } ?: "The command could not start.")
+        else -> "Preview not running" to "Start the project's dev server here, or ask the agent to start the preview."
+    }
+    ExpressiveEmptyState(Icons.Rounded.Preview, title, body, polygon = MaterialShapes.Arch) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+            if (starting) {
+                Text(
+                    server?.command.orEmpty(),
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.height(12.dp))
+                OutlinedButton(onClick = onStop) {
+                    Icon(Icons.Rounded.Stop, null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Stop")
+                }
+            } else {
+                OutlinedTextField(
+                    value = command,
+                    onValueChange = onCommandChange,
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    label = { Text("Start command") },
+                    placeholder = { Text("npm run dev") },
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
+                    keyboardActions = KeyboardActions(onGo = { if (command.isNotBlank()) onStart() }),
+                )
+                Spacer(Modifier.height(12.dp))
+                Button(onClick = onStart, enabled = command.isNotBlank()) {
+                    Icon(Icons.Rounded.PlayArrow, null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Start preview")
+                }
+            }
+            val log = server?.log?.takeIf { starting || failed }?.lines()?.takeLast(8)?.joinToString("\n")?.trim()
+            if (!log.isNullOrEmpty()) {
+                Spacer(Modifier.height(16.dp))
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        log,
+                        modifier = Modifier.padding(12.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                        lineHeight = 15.sp,
+                        maxLines = 8,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+    }
+}
+
 private fun normalizePreviewUrl(input: String): String? {
     val raw = input.trim()
     if (raw.isBlank()) return null
@@ -1664,7 +1783,7 @@ private fun normalizePreviewUrl(input: String): String? {
 
 private fun Uri.isLoopbackPreviewUrl(): Boolean =
     scheme in setOf("data", "blob", "about") ||
-        (scheme in setOf("http", "https", "ws", "wss") && host in setOf("127.0.0.1", "localhost", "0.0.0.0"))
+        (scheme in setOf("http", "https", "ws", "wss") && host in setOf("127.0.0.1", "localhost", "0.0.0.0", "[::1]", "::1"))
 
 private fun blockedPreviewResponse(): WebResourceResponse =
     WebResourceResponse("text/plain", "UTF-8", 403, "Blocked", emptyMap(), ByteArrayInputStream(ByteArray(0)))

@@ -100,6 +100,8 @@ internal fun claudePrintCommand(
     effort: String = "",
     controls: ClaudeSessionControls = ClaudeSessionControls(),
     appendSystemPrompt: String = "",
+    /** Guest path of an `--mcp-config` file for PocketCode's built-in tools. */
+    pocketMcpConfigPath: String? = null,
 ): List<String> = buildList {
     add(executable)
     // --bare limits Claude Code to ANTHROPIC_API_KEY/apiKeyHelper and never
@@ -125,8 +127,16 @@ internal fun claudePrintCommand(
         add(effort)
     }
     addAll(claudeControlArguments(controls))
+    if (pocketMcpConfigPath != null) {
+        add("--mcp-config")
+        add(pocketMcpConfigPath)
+        // Bash is already auto-approved, and these tools do less than Bash can.
+        add("--allowedTools")
+        add("mcp__$POCKET_MCP_SERVER_NAME")
+    }
     val systemPrompt = listOfNotNull(
         appendSystemPrompt.takeIf(String::isNotBlank),
+        POCKET_PREVIEW_SYSTEM_PROMPT.takeIf { pocketMcpConfigPath != null },
         PLAN_MODE_SYSTEM_PROMPT.takeIf { controls.planMode },
     ).joinToString("\n\n")
     if (systemPrompt.isNotBlank()) {
@@ -137,8 +147,18 @@ internal fun claudePrintCommand(
     add("25")
 }
 
+private const val POCKET_MCP_CONFIG_FILE = "pocketcode-mcp.json"
+
+internal const val POCKET_PREVIEW_SYSTEM_PROMPT =
+    "PocketCode shows web apps in its Preview tab. To run a dev server for the user to see, call " +
+        "mcp__${POCKET_MCP_SERVER_NAME}__preview_start (optionally with the command) instead of starting it with Bash: " +
+        "servers started from Bash stop when your turn ends, while preview_start keeps the server running and opens it in the app. " +
+        "Use preview_status to read the server's URL and recent output, and preview_stop to stop it."
+
 class ClaudeRuntimeBridge(
     private val context: Context,
+    /** `--mcp-config` content for PocketCode's built-in tools, or null when unavailable. */
+    private val pocketMcpConfig: () -> String? = { null },
     /** Claude Code `--effort` for subscription runs. */
     private val effort: () -> String = { "" },
     /** Command palette switches (plan mode, disabled tools, MCP servers, skills, subagents). */
@@ -267,6 +287,7 @@ class ClaudeRuntimeBridge(
                 effort = effort(),
                 controls = controls(),
                 appendSystemPrompt = systemContext,
+                pocketMcpConfigPath = writePocketMcpConfig(),
             )
             Log.d("ClaudeBridge", "Launching command: $command")
             val process = installer.process(
@@ -549,6 +570,17 @@ class ClaudeRuntimeBridge(
         }
         removeChangedPath(projectId, path)
         true
+    }
+
+    /** Writes the built-in MCP config into the shared bridge folder; returns its guest path. */
+    private fun writePocketMcpConfig(): String? {
+        val config = pocketMcpConfig() ?: return null
+        val file = File(context.filesDir, "runtime-bridge/$POCKET_MCP_CONFIG_FILE")
+        return runCatching {
+            file.parentFile?.mkdirs()
+            file.writeText(config)
+            "/pocket-bridge/$POCKET_MCP_CONFIG_FILE"
+        }.getOrNull()
     }
 
     private suspend fun watchPermissionRequests(sessionId: String) {
