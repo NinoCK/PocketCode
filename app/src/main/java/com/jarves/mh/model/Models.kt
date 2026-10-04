@@ -347,6 +347,22 @@ data class ToolRequest(
     val risk: RiskLevel,
 )
 
+data class AgentQuestionOption(val label: String, val description: String = "")
+
+data class AgentQuestionItem(
+    val question: String,
+    val header: String,
+    val options: List<AgentQuestionOption>,
+    val multiSelect: Boolean = false,
+)
+
+/** Multiple-choice questions the agent asked through Claude Code's AskUserQuestion tool. */
+data class AgentQuestion(
+    val requestId: String,
+    val sessionId: String,
+    val questions: List<AgentQuestionItem>,
+)
+
 sealed interface RuntimeEvent {
     val sessionId: String
 
@@ -374,6 +390,14 @@ sealed interface RuntimeEvent {
     data class ToolApproved(override val sessionId: String, val approvalId: String) : RuntimeEvent
     data class ToolRejected(override val sessionId: String, val approvalId: String) : RuntimeEvent
     data class ToolCompleted(override val sessionId: String, val toolName: String, val summary: String) : RuntimeEvent
+    data class QuestionAsked(override val sessionId: String, val question: AgentQuestion) : RuntimeEvent
+
+    /** [answers] maps each question to its answer; null when the user skipped or the run withdrew it. */
+    data class QuestionAnswered(
+        override val sessionId: String,
+        val requestId: String,
+        val answers: Map<String, String>?,
+    ) : RuntimeEvent
     data class FilesChanged(override val sessionId: String, val changes: List<ChangeItem>) : RuntimeEvent {
         val paths: List<String> get() = changes.map { it.path }
     }

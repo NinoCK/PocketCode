@@ -62,6 +62,9 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
+import com.jarves.mh.runtime.ClaudeSessionControls
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.ArrowForward
 import androidx.compose.material.icons.outlined.AutoAwesome
@@ -190,10 +193,13 @@ internal fun WorkspaceScreen(
     state: AppUiState,
     onSetClaudeModel: (String) -> Unit = {},
     onSetClaudeEffort: (String) -> Unit = {},
+    onUpdateClaudeControls: ((ClaudeSessionControls) -> ClaudeSessionControls) -> Unit = {},
+    onRefreshClaudeCapabilities: () -> Unit = {},
     onBack: () -> Unit,
     onSend: (String) -> Unit,
     onStop: () -> Unit,
     onApproval: (Boolean) -> Unit,
+    onAnswerQuestion: (Map<String, String>?) -> Unit = {},
     onRefreshFiles: () -> Unit,
     onOpenFile: (WorkspaceEntry) -> Unit,
     onCloseFile: () -> Unit,
@@ -250,7 +256,8 @@ internal fun WorkspaceScreen(
     var userScrolledUp by rememberSaveable { mutableStateOf(false) }
     val chatItemCount = state.messages.size +
         (if (state.liveProcess.isNotEmpty() || state.liveThinking || state.awaitingAgent) 1 else 0) +
-        (if (state.pendingApproval != null) 1 else 0)
+        (if (state.pendingApproval != null) 1 else 0) +
+        (if (state.pendingQuestion != null) 1 else 0)
 
     LaunchedEffect(state.activeChatId) {
         userScrolledUp = false
@@ -270,12 +277,14 @@ internal fun WorkspaceScreen(
         state.liveProcess.size,
         state.liveProcess.lastOrNull()?.detail,
         state.pendingApproval,
+        state.pendingQuestion,
     ) {
         if (!state.isRunning || chatItemCount <= 0 || userScrolledUp || chatListState.isScrollInProgress) return@LaunchedEffect
         if (!chatListState.canScrollForward) chatListState.scrollToItem(chatItemCount - 1)
     }
 
     var selectedTab by rememberSaveable { mutableStateOf(initialTab) }
+    var modelSheetOpen by rememberSaveable { mutableStateOf(false) }
     var showChats by rememberSaveable { mutableStateOf(false) }
     // Folder chips (extracted ZIPs) open in the Files tab; files open in another app.
     val openAttachment: (ChatAttachment) -> Unit = { attachment ->
@@ -486,6 +495,8 @@ internal fun WorkspaceScreen(
                     WorkspaceTab.CHAT -> ChatTab(
                         messages = state.messages,
                         approval = state.pendingApproval,
+                        question = state.pendingQuestion,
+                        onAnswerQuestion = onAnswerQuestion,
                         liveProcess = state.liveProcess,
                         isRunning = state.isRunning,
                         onSend = onSend,
@@ -510,6 +521,40 @@ internal fun WorkspaceScreen(
                             ClaudeChatOptions(state.provider.model, state.claudeEffort, onSetClaudeModel, onSetClaudeEffort)
                         } else {
                             null
+                        },
+                        commands = run {
+                            val claudeAgent = state.agentKind == AgentKind.CLAUDE_CODE
+                            ChatCommandState(
+                                items = buildCommandPaletteItems(
+                                    claudeAgent = claudeAgent,
+                                    controls = state.claudeControls,
+                                    capabilities = state.claudeCapabilities,
+                                    isRunning = state.isRunning,
+                                    hasChanges = state.changes.isNotEmpty(),
+                                    canChangeModel = state.provider.kind == ProviderKind.CLAUDE,
+                                    onUpdateControls = onUpdateClaudeControls,
+                                    onOpenModelSheet = { modelSheetOpen = true },
+                                    onNewChat = onCreateChat,
+                                    onStop = onStop,
+                                    onUndo = onUndoChanges,
+                                    onOpenFiles = {
+                                        selectedTab = WorkspaceTab.FILES
+                                        onRefreshFiles()
+                                    },
+                                    onOpenTerminal = {
+                                        selectedTab = WorkspaceTab.TERMINAL
+                                        onTerminalOpened()
+                                    },
+                                    onRefreshCapabilities = onRefreshClaudeCapabilities,
+                                ),
+                                footer = if (claudeAgent && !state.claudeCapabilities.reportedByClaude) {
+                                    "Send a message once to load MCP servers, tools and built-in subagents."
+                                } else null,
+                                planMode = claudeAgent && state.claudeControls.planMode,
+                                onExitPlanMode = { onUpdateClaudeControls { it.copy(planMode = false) } },
+                                modelSheetOpen = modelSheetOpen,
+                                onModelSheetOpenChange = { modelSheetOpen = it },
+                            )
                         },
                     )
                     WorkspaceTab.FILES -> WorkspaceFilesTab(
@@ -734,6 +779,9 @@ internal fun ChatTab(
     onContinueHere: () -> Unit = {},
     claudeOptions: ClaudeChatOptions? = null,
     awaitingAgent: Boolean = false,
+    commands: ChatCommandState? = null,
+    question: com.jarves.mh.model.AgentQuestion? = null,
+    onAnswerQuestion: (Map<String, String>?) -> Unit = {},
 ) {
     val view = LocalView.current
     // Keep the screen on while the agent works in this chat; released when it finishes or the tab closes.
@@ -745,7 +793,7 @@ internal fun ChatTab(
     val chatScope = rememberCoroutineScope()
     val readerAtBottom by remember { derivedStateOf { !listState.canScrollForward } }
     val showLive = liveProcess.isNotEmpty() || thinkingActive || awaitingAgent
-    val conversationEmpty = messages.isEmpty() && !showLive && approval == null
+    val conversationEmpty = messages.isEmpty() && !showLive && approval == null && question == null
 
     Column(Modifier.fillMaxSize().imePadding()) {
         Box(Modifier.weight(1f)) {
@@ -796,6 +844,9 @@ internal fun ChatTab(
                         }
                     }
                     approval?.let { request -> item(key = "approval") { ApprovalCard(request, onApproval, Modifier.animateItem()) } }
+                    question?.let { asked ->
+                        item(key = "question:${asked.requestId}") { QuestionCard(asked, onAnswerQuestion, Modifier.animateItem()) }
+                    }
                 }
             }
             androidx.compose.animation.AnimatedVisibility(
@@ -848,10 +899,20 @@ internal fun ChatTab(
                 pendingAttachments = pendingAttachments,
                 archiveProgress = archiveProgress,
                 claudeOptions = claudeOptions,
+                commands = commands,
                 onAttach = onAttach,
                 onRemoveAttachment = onRemoveAttachment,
                 onSend = {
-                    onSend(prompt)
+                    val command = commands?.let { paletteCommandFor(it.items, prompt) }
+                    if (command != null) {
+                        when (val action = command.action) {
+                            is PaletteAction.Run -> action.run()
+                            is PaletteAction.Toggle -> if (action.enabled) action.onChange(!action.checked)
+                            is PaletteAction.Insert -> Unit
+                        }
+                    } else {
+                        onSend(prompt)
+                    }
                     prompt = ""
                 },
                 onStop = onStop,
@@ -898,12 +959,20 @@ private fun Composer(
     pendingAttachments: List<ChatAttachment>,
     archiveProgress: String?,
     claudeOptions: ClaudeChatOptions?,
+    commands: ChatCommandState?,
     onAttach: () -> Unit,
     onRemoveAttachment: (String) -> Unit,
     onSend: () -> Unit,
     onStop: () -> Unit,
 ) {
     val canSend = prompt.isNotBlank() || pendingAttachments.isNotEmpty()
+    // The palette follows a leading "/" until the first space; closing it hides it for this "/".
+    var paletteDismissed by remember(prompt.startsWith("/")) { mutableStateOf(false) }
+    val paletteQuery = prompt.takeIf { it.startsWith("/") && it.none(Char::isWhitespace) }?.drop(1)
+    val showPalette = commands != null && commands.items.isNotEmpty() && paletteQuery != null && !paletteDismissed
+    // Text set from outside (a palette item, a suggestion, clearing after send) puts the cursor at the end.
+    var fieldValue by remember { mutableStateOf(TextFieldValue(prompt, TextRange(prompt.length))) }
+    if (fieldValue.text != prompt) fieldValue = TextFieldValue(prompt, TextRange(prompt.length))
     Column(Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 10.dp)) {
         AnimatedVisibility(visible = pendingAttachments.isNotEmpty()) {
             Row(
@@ -928,8 +997,43 @@ private fun Composer(
                 )
             }
         }
-        if (claudeOptions != null) {
-            ClaudeChatOptionsChip(options = claudeOptions, enabled = !isRunning, modifier = Modifier.padding(start = 4.dp, bottom = 6.dp))
+        AnimatedVisibility(visible = showPalette) {
+            if (commands != null) {
+                CommandPalette(
+                    items = commands.items,
+                    query = paletteQuery.orEmpty(),
+                    footer = commands.footer,
+                    onDismiss = { paletteDismissed = true },
+                    onSelect = { item ->
+                        when (val action = item.action) {
+                            is PaletteAction.Run -> {
+                                action.run()
+                                onPromptChange("")
+                            }
+                            is PaletteAction.Insert -> onPromptChange(action.text)
+                            is PaletteAction.Toggle -> action.onChange(!action.checked)
+                        }
+                    },
+                    modifier = Modifier.padding(bottom = 8.dp),
+                )
+            }
+        }
+        if (claudeOptions != null || commands?.planMode == true) {
+            Row(
+                Modifier.padding(start = 4.dp, bottom = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (claudeOptions != null) {
+                    ClaudeChatOptionsChip(
+                        options = claudeOptions,
+                        enabled = !isRunning,
+                        sheetOpen = commands?.modelSheetOpen ?: false,
+                        onSheetOpenChange = { commands?.onModelSheetOpenChange?.invoke(it) },
+                    )
+                }
+                if (commands?.planMode == true) PlanModeChip(onExit = commands.onExitPlanMode)
+            }
         }
         Surface(
             shape = RoundedCornerShape(28.dp),
@@ -945,8 +1049,11 @@ private fun Composer(
                     )
                 }
                 BasicTextField(
-                    value = prompt,
-                    onValueChange = onPromptChange,
+                    value = fieldValue,
+                    onValueChange = {
+                        fieldValue = it
+                        if (it.text != prompt) onPromptChange(it.text)
+                    },
                     modifier = Modifier.weight(1f).heightIn(min = 48.dp, max = 160.dp).padding(horizontal = 4.dp, vertical = 13.dp),
                     textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
                     cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),

@@ -101,6 +101,7 @@ private fun UiGallery(screen: String, sample: String) {
     var draft by remember {
         mutableStateOf(if (screen == "file-edit") androidx.compose.foundation.text.input.TextFieldState(gallerySample(sample).second) else null)
     }
+    var galleryControls by remember { mutableStateOf(com.jarves.mh.runtime.ClaudeSessionControls()) }
     val workspaceState = AppUiState(
         projects = sampleProjects,
         activeProject = sampleProjects.first(),
@@ -180,7 +181,7 @@ private fun UiGallery(screen: String, sample: String) {
             onSelectAgent = {},
             onToggleTheme = {},
         )
-        "chat", "chat-empty", "chat-live", "chat-attachments", "files", "files-upload", "files-conflict", "file", "file-edit",
+        "chat", "chat-empty", "chat-live", "chat-attachments", "chat-commands", "chat-question", "files", "files-upload", "files-conflict", "file", "file-edit",
         "project-terminal", "preview" -> {
             val state = when (screen) {
                 "chat-empty" -> workspaceState.copy(messages = emptyList())
@@ -233,10 +234,58 @@ private fun UiGallery(screen: String, sample: String) {
                         risk = com.jarves.mh.model.RiskLevel.HIGH,
                     ),
                 )
+                "chat-question" -> workspaceState.copy(
+                    messages = sampleMessages.take(1),
+                    isRunning = true,
+                    taskStartedAtMillis = now - 12_000,
+                    liveProcess = listOf(ActivityItem("Waiting for your answer", "Where should the setting live?", isComplete = false)),
+                    pendingQuestion = com.jarves.mh.model.AgentQuestion(
+                        requestId = "q1",
+                        sessionId = "s",
+                        questions = listOf(
+                            com.jarves.mh.model.AgentQuestionItem(
+                                question = "Where should the dark mode setting live?",
+                                header = "Placement",
+                                options = listOf(
+                                    com.jarves.mh.model.AgentQuestionOption("Settings screen", "Next to the other display options"),
+                                    com.jarves.mh.model.AgentQuestionOption("Quick toggle", "An icon in the top bar"),
+                                ),
+                            ),
+                            com.jarves.mh.model.AgentQuestionItem(
+                                question = "Which themes should it offer?",
+                                header = "Themes",
+                                options = listOf(
+                                    com.jarves.mh.model.AgentQuestionOption("Light"),
+                                    com.jarves.mh.model.AgentQuestionOption("Dark"),
+                                    com.jarves.mh.model.AgentQuestionOption("Follow system"),
+                                ),
+                                multiSelect = true,
+                            ),
+                        ),
+                    ),
+                )
+                "chat-commands" -> workspaceState.copy(
+                    claudeControls = galleryControls,
+                    claudeCapabilities = com.jarves.mh.runtime.ClaudeCapabilities(
+                        commands = listOf(
+                            com.jarves.mh.runtime.ClaudeCommandInfo("deploy", "Build and publish a release", isSkill = true),
+                            com.jarves.mh.runtime.ClaudeCommandInfo("frontend:component", "Scaffold a Compose component", isSkill = true),
+                            com.jarves.mh.runtime.ClaudeCommandInfo("review", "Review a pull request"),
+                        ),
+                        agents = listOf(
+                            com.jarves.mh.runtime.ClaudeAgentInfo("general-purpose"),
+                            com.jarves.mh.runtime.ClaudeAgentInfo("Explore", "Fast read-only codebase search"),
+                        ),
+                        mcpServers = listOf(com.jarves.mh.runtime.McpServerInfo("github", "connected")),
+                        tools = listOf("Bash", "Edit", "Read", "WebFetch", "WebSearch"),
+                        reportedByClaude = true,
+                    ),
+                )
                 else -> workspaceState
             }
             WorkspaceScreen(
                 state = state,
+                onUpdateClaudeControls = { galleryControls = it(galleryControls) },
                 onBack = {},
                 onSend = {},
                 onStop = {},

@@ -239,6 +239,8 @@ data class AppUiState(
     /** Progress line while a chat-attached ZIP is extracted into the project; null when idle. */
     val archiveExtractionMessage: String? = null,
     val pendingApproval: ToolRequest? = null,
+    /** Questions Claude Code asked with AskUserQuestion, waiting for the user's answers. */
+    val pendingQuestion: com.jarves.mh.model.AgentQuestion? = null,
     val changes: List<ChangeItem> = emptyList(),
     val activity: List<ActivityItem> = emptyList(),
     val liveProcess: List<ActivityItem> = emptyList(),
@@ -288,6 +290,9 @@ data class AppUiState(
     val antigravityAuth: AntigravityAuthState = AntigravityAuthState(),
     val claudeAuth: ClaudeAuthState = ClaudeAuthState(),
     val claudeEffort: String = "default",
+    val claudeControls: com.jarves.mh.runtime.ClaudeSessionControls = com.jarves.mh.runtime.ClaudeSessionControls(),
+    /** Skills, commands, agents, MCP servers and tools for the active project's command palette. */
+    val claudeCapabilities: com.jarves.mh.runtime.ClaudeCapabilities = com.jarves.mh.runtime.ClaudeCapabilities(),
     val antigravityModel: String = "",
     val antigravityEffort: String = "high",
     val antigravityModels: List<String> = emptyList(),
@@ -322,7 +327,11 @@ data class AppUiState(
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val vault = ApiKeyVault(application)
     private val preferences = AppPreferences(application)
-    private val claudeRuntime = ClaudeRuntimeBridge(application, effort = { _state.value.claudeEffort }) { profile ->
+    private val claudeRuntime = ClaudeRuntimeBridge(
+        application,
+        effort = { _state.value.claudeEffort },
+        controls = { _state.value.claudeControls },
+    ) { profile ->
         vault.get(profile.kind.name)
     }
     private val dshRuntime = DshRuntimeBridge(application) { profile -> vault.get(profile.kind.name) }
@@ -399,6 +408,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             antigravityModel = preferences.antigravityModel,
             antigravityEffort = preferences.antigravityEffort,
             claudeEffort = preferences.claudeEffort,
+            claudeControls = com.jarves.mh.runtime.ClaudeSessionControls.fromJson(preferences.claudeControls),
             themeMode = runCatching { com.jarves.mh.ui.theme.AppThemeMode.valueOf(preferences.themeMode.uppercase()) }
                 .getOrDefault(com.jarves.mh.ui.theme.AppThemeMode.SYSTEM),
             editorPreferences = EditorPreferences(
@@ -1086,6 +1096,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     init {
         viewModelScope.launch { RuntimeSetupController.snapshot.collect(::onSetupSnapshot) }
         viewModelScope.launch { claudeRuntime.events.collect(::onRuntimeEvent) }
+        viewModelScope.launch {
+            claudeRuntime.capabilityUpdates.collect { projectId ->
+                if (_state.value.activeProject?.id == projectId) refreshClaudeCapabilities()
+            }
+        }
         viewModelScope.launch { bootstrap() }
     }
 
@@ -1666,6 +1681,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(claudeEffort = effort) }
     }
 
+    /** Reloads the command palette's skills, agents, MCP servers and tools for the open project. */
+    fun refreshClaudeCapabilities() {
+        val project = _state.value.activeProject ?: return
+        viewModelScope.launch {
+            val capabilities = claudeRuntime.loadCapabilities(project.id)
+            if (_state.value.activeProject?.id == project.id) {
+                _state.update { it.copy(claudeCapabilities = capabilities) }
+            }
+        }
+    }
+
+    fun updateClaudeControls(transform: (com.jarves.mh.runtime.ClaudeSessionControls) -> com.jarves.mh.runtime.ClaudeSessionControls) {
+        val updated = transform(_state.value.claudeControls)
+        preferences.claudeControls = updated.toJson()
+        _state.update { it.copy(claudeControls = updated) }
+    }
+
     private fun onClaudeSubscriptionToken(token: String) {
         val current = _state.value.provider
         val profile = if (current.kind == ProviderKind.CLAUDE) current else ProviderProfile(ProviderKind.CLAUDE)
@@ -2069,6 +2101,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         refreshProjectFiles()
+        _state.update { it.copy(claudeCapabilities = com.jarves.mh.runtime.ClaudeCapabilities()) }
+        refreshClaudeCapabilities()
         viewModelScope.launch {
             val pending = activeRuntime().loadPendingChanges(project.id)
             if (_state.value.activeProject?.id == project.id) _state.update { it.copy(changes = pending) }
@@ -2134,6 +2168,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 isRunning = false,
                 activeSessionId = null,
                 pendingApproval = null,
+                pendingQuestion = null,
                 projectTerminalLines = emptyList(),
                 projectTerminalLiveOutput = "",
                 projectTerminalRunning = false,
@@ -3026,6 +3061,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 taskStartedAtMillis = null,
                 taskFinishedAtMillis = null,
                 pendingApproval = null,
+                pendingQuestion = null,
                 pendingAttachments = emptyList(),
             )
         }
@@ -3047,6 +3083,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 taskStartedAtMillis = null,
                 taskFinishedAtMillis = null,
                 pendingApproval = null,
+                pendingQuestion = null,
                 pendingAttachments = emptyList(),
             )
         }
@@ -3739,6 +3776,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { activeRuntime().respondToApproval(request, approved) }
     }
 
+    /** Answers Claude's AskUserQuestion prompt, keyed by question text; null skips it. */
+    fun answerQuestion(answers: Map<String, String>?) {
+        val question = _state.value.pendingQuestion ?: return
+        viewModelScope.launch { claudeRuntime.answerQuestion(question.requestId, answers) }
+    }
+
     fun stopTask() {
         if (!_state.value.isRunning) return
         viewModelScope.launch { activeRuntime().stopActiveSession() }
@@ -3949,6 +3992,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 is RuntimeEvent.ToolRejected -> appendWorkItem(current.copy(
                     pendingApproval = null,
                 ), ActivityItem("Action rejected", "Claude will continue without this action"))
+                is RuntimeEvent.QuestionAsked -> appendWorkItem(
+                    current.copy(pendingQuestion = event.question),
+                    ActivityItem("Waiting for your answer", event.question.questions.first().question, false),
+                )
+                is RuntimeEvent.QuestionAnswered -> {
+                    val cleared = current.copy(pendingQuestion = null)
+                    val answers = event.answers
+                    if (answers == null) {
+                        appendWorkItem(cleared, ActivityItem("Question skipped", "Claude will continue without an answer"))
+                    } else {
+                        // The answers read as the user's reply, so later runs see them in the chat history.
+                        val reply = answers.entries.joinToString("\n\n") { (question, answer) -> "$question\n→ $answer" }
+                        val timeline = finishWorkSegment(cleared)
+                        timeline.copy(messages = timeline.messages + ChatMessage(fromUser = true, text = reply))
+                    }
+                }
                 is RuntimeEvent.ToolCompleted -> {
                     val runningIndex = current.liveProcess.indexOfLast {
                         !it.isComplete && it.title == "Running ${event.toolName}"
@@ -3999,6 +4058,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     attachTaskDuration(finishWorkSegment(current, finishedAt), finishedAt).copy(
                         isRunning = false,
                         activeSessionId = null,
+                        pendingQuestion = null,
                         activity = listOf(ActivityItem("Task completed", "${current.agentKind.title} finished successfully")) +
                             current.activity.map { if (!it.isComplete) it.copy(isComplete = true) else it },
                         taskFinishedAtMillis = finishedAt,
@@ -4016,6 +4076,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         isRunning = false,
                         activeSessionId = null,
                         pendingApproval = null,
+                        pendingQuestion = null,
                         toastMessage = event.reason.takeIf { reason ->
                             reason.contains("user not found", true) ||
                                 reason.contains("API key", true) ||

@@ -491,9 +491,11 @@ internal data class ClaudeChatOptions(
 internal fun ClaudeChatOptionsChip(
     options: ClaudeChatOptions,
     enabled: Boolean,
+    sheetOpen: Boolean,
+    onSheetOpenChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    var showSheet by rememberSaveable { mutableStateOf(false) }
+    val showSheet = sheetOpen
     val modelLabel = ClaudeSubscriptionModels.firstOrNull { it.first == options.model }?.second ?: "Default"
     val effortLabel = ClaudeEffortLevels.firstOrNull { it.first == options.effort }?.second ?: "Default"
     val label = when {
@@ -508,7 +510,7 @@ internal fun ClaudeChatOptionsChip(
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
         modifier = modifier
             .clip(RoundedCornerShape(50))
-            .clickable(enabled = enabled, onClickLabel = "Change model and effort") { showSheet = true }
+            .clickable(enabled = enabled, onClickLabel = "Change model and effort") { onSheetOpenChange(true) }
             .alpha(if (enabled) 1f else 0.5f),
     ) {
         Row(
@@ -524,7 +526,7 @@ internal fun ClaudeChatOptionsChip(
 
     if (showSheet) {
         ModalBottomSheet(
-            onDismissRequest = { showSheet = false },
+            onDismissRequest = { onSheetOpenChange(false) },
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
         ) {
             Column(Modifier.padding(start = 20.dp, end = 20.dp, bottom = 28.dp)) {

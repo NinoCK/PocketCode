@@ -34,6 +34,15 @@ import org.json.JSONArray
 internal object ProviderRuntimeErrorDetector {
     fun detect(line: String, subscription: Boolean = false): String? {
         val json = runCatching { JSONObject(line) }.getOrNull()
+        // Replies, tool output and questions can mention "rate limit" or "expired";
+        // only error reports and non-JSON diagnostics are checked.
+        when (json?.optString("type")) {
+            "user", "stream_event", "control_request", "control_cancel_request" -> return null
+            // Claude Code marks a failed API call with an `error` field on the assistant message.
+            "assistant" -> if (json.optString("error").isBlank()) return null
+            "result" -> if (!json.optBoolean("is_error")) return null
+            "system" -> if (json.optString("subtype") == "init") return null
+        }
         val combined = buildString {
             append(line)
             json?.let {
@@ -79,13 +88,18 @@ internal object ProviderRuntimeErrorDetector {
     }
 }
 
-/** Claude Code print-mode command line used for every coding task. */
+/**
+ * Claude Code print-mode command line used for every coding task. The prompt
+ * goes in on stdin as a stream-json user message ([claudeUserMessage]), and
+ * permission prompts, including AskUserQuestion, come back as control requests.
+ */
 internal fun claudePrintCommand(
     executable: String,
-    prompt: String,
     model: String,
     subscription: Boolean,
     effort: String = "",
+    controls: ClaudeSessionControls = ClaudeSessionControls(),
+    appendSystemPrompt: String = "",
 ): List<String> = buildList {
     add(executable)
     // --bare limits Claude Code to ANTHROPIC_API_KEY/apiKeyHelper and never
@@ -93,7 +107,10 @@ internal fun claudePrintCommand(
     // every request goes out without credentials.
     if (!subscription) add("--bare")
     add("-p")
-    add(prompt)
+    add("--input-format")
+    add("stream-json")
+    add("--permission-prompt-tool")
+    add("stdio")
     add("--output-format")
     add("stream-json")
     add("--include-partial-messages")
@@ -107,6 +124,15 @@ internal fun claudePrintCommand(
         add("--effort")
         add(effort)
     }
+    addAll(claudeControlArguments(controls))
+    val systemPrompt = listOfNotNull(
+        appendSystemPrompt.takeIf(String::isNotBlank),
+        PLAN_MODE_SYSTEM_PROMPT.takeIf { controls.planMode },
+    ).joinToString("\n\n")
+    if (systemPrompt.isNotBlank()) {
+        add("--append-system-prompt")
+        add(systemPrompt)
+    }
     add("--max-turns")
     add("25")
 }
@@ -115,12 +141,22 @@ class ClaudeRuntimeBridge(
     private val context: Context,
     /** Claude Code `--effort` for subscription runs. */
     private val effort: () -> String = { "" },
+    /** Command palette switches (plan mode, disabled tools, MCP servers, skills, subagents). */
+    private val controls: () -> ClaudeSessionControls = { ClaudeSessionControls() },
     private val secretFor: (ProviderProfile) -> String?,
 ) : RuntimeBridge {
     private val installer = RuntimeInstaller(context)
     private val eventBus = MutableSharedFlow<RuntimeEvent>(extraBufferCapacity = 64)
     override val events: Flow<RuntimeEvent> = eventBus
+    private val capabilityBus = MutableSharedFlow<String>(extraBufferCapacity = 8)
+    /** Project ids whose Claude Code capabilities changed after a run reported them. */
+    val capabilityUpdates: Flow<String> = capabilityBus
+    @Volatile private var activeProjectId: String? = null
     private val pending = ConcurrentHashMap<String, PendingPermission>()
+    /** Permission prompts and questions waiting for the user, by control request id. */
+    private val controlRequests = ConcurrentHashMap<String, PendingControl>()
+    private val stdinLock = Any()
+    @Volatile private var activeStdin: java.io.OutputStream? = null
     private val toolNames = ConcurrentHashMap<String, String>()
     private val seenToolCalls = ConcurrentHashMap.newKeySet<String>()
     private val finishedSessions = ConcurrentHashMap.newKeySet<String>()
@@ -145,6 +181,7 @@ class ClaudeRuntimeBridge(
         activeSessionId = sessionId
         userStopRequested = false
         activeProjectSlug = projectSlug
+        activeProjectId = projectId
         taskStartedAtElapsedRealtime = android.os.SystemClock.elapsedRealtime()
         lastForegroundProgressAt = 0L
         foregroundResultPosted = false
@@ -209,14 +246,27 @@ class ClaudeRuntimeBridge(
 
             // Build a context-aware prompt that includes conversation history
             val guestWorkspacePath = "/workspace/$projectSlug"
-            val contextPrompt = buildContextPrompt(prompt, conversationHistory, guestWorkspacePath, projectKind)
+            // Claude Code only expands `/skill args` at the very start of the prompt,
+            // so a known slash command goes first and the context moves to the system prompt.
+            val slashCommand = slashCommandName(prompt)?.takeIf { name ->
+                readCapabilities(projectId).findCommand(name) != null
+            }
+            val contextPrompt = if (slashCommand != null) {
+                prompt.trimStart()
+            } else {
+                buildContextPrompt(prompt, conversationHistory, guestWorkspacePath, projectKind)
+            }
+            val systemContext = if (slashCommand != null) {
+                buildContextPrompt(null, conversationHistory, guestWorkspacePath, projectKind)
+            } else ""
 
             val command = claudePrintCommand(
                 executable = launch.executable,
-                prompt = contextPrompt,
                 model = launch.environment["ANTHROPIC_MODEL"] ?: provider.model,
                 subscription = subscription,
                 effort = effort(),
+                controls = controls(),
+                appendSystemPrompt = systemContext,
             )
             Log.d("ClaudeBridge", "Launching command: $command")
             val process = installer.process(
@@ -228,6 +278,10 @@ class ClaudeRuntimeBridge(
                 guestWorkspacePath = guestWorkspacePath,
             )
             activeProcess = process
+            synchronized(stdinLock) { activeStdin = process.outputStream }
+            if (!writeControl(claudeUserMessage(contextPrompt)) && !userStopRequested) {
+                error("Could not send the message to Claude Code")
+            }
             if (userStopRequested) process.destroy()
             coroutineScope {
                 val permissionWatcher = launch { watchPermissionRequests(sessionId) }
@@ -282,6 +336,7 @@ class ClaudeRuntimeBridge(
                     permission.response.writeText("deny")
                     pending.remove(permission.request.approvalId)
                 }
+                controlRequests.entries.removeAll { it.value.sessionId == sessionId }
                 val changed = changedFiles(workspace, before)
                 if (changed.isNotEmpty()) {
                     Log.d("ClaudeBridge", "Changed files: $changed")
@@ -319,6 +374,8 @@ class ClaudeRuntimeBridge(
         }
         formatGateway?.close()
         openRouterGateway?.close()
+        closeStdin()
+        controlRequests.entries.removeAll { it.value.sessionId == sessionId }
         activeProcess = null
         activeSessionId = null
         RuntimeTaskController.stopAction = null
@@ -326,12 +383,89 @@ class ClaudeRuntimeBridge(
     }
 
     override suspend fun respondToApproval(request: ToolRequest, approved: Boolean) = withContext(Dispatchers.IO) {
+        controlRequests.remove(request.approvalId)?.let { control ->
+            writeControl(
+                if (approved) controlAllow(request.approvalId, control.input)
+                else controlDeny(request.approvalId, "The user rejected this action."),
+            )
+            eventBus.emit(
+                if (approved) RuntimeEvent.ToolApproved(request.sessionId, request.approvalId)
+                else RuntimeEvent.ToolRejected(request.sessionId, request.approvalId),
+            )
+            return@withContext
+        }
         val permission = pending.remove(request.approvalId) ?: return@withContext
         permission.response.writeText(if (approved) "allow" else "deny")
         eventBus.emit(
             if (approved) RuntimeEvent.ToolApproved(request.sessionId, request.approvalId)
             else RuntimeEvent.ToolRejected(request.sessionId, request.approvalId),
         )
+    }
+
+    /**
+     * Sends the user's answers to an AskUserQuestion prompt, keyed by question
+     * text. Null skips the questions and lets Claude carry on without them.
+     */
+    suspend fun answerQuestion(requestId: String, answers: Map<String, String>?) = withContext(Dispatchers.IO) {
+        val control = controlRequests.remove(requestId) ?: return@withContext
+        writeControl(
+            if (answers != null) {
+                controlAllow(requestId, answeredQuestionInput(control.input, answers))
+            } else {
+                controlDeny(requestId, "The user skipped these questions. Continue with your best judgement.")
+            },
+        )
+        eventBus.emit(RuntimeEvent.QuestionAnswered(control.sessionId, requestId, answers))
+        pushForegroundProgress(if (answers != null) "Continuing with your answers…" else "Continuing…")
+    }
+
+    private suspend fun handleControlRequest(sessionId: String, json: JSONObject) {
+        val requestId = json.optString("request_id").takeIf(String::isNotBlank) ?: return
+        val request = json.optJSONObject("request") ?: return
+        if (request.optString("subtype") != "can_use_tool") {
+            writeControl(controlError(requestId, "PocketCode does not handle ${request.optString("subtype")} requests"))
+            return
+        }
+        val toolName = request.optString("tool_name").ifBlank { "Tool" }
+        val input = request.optJSONObject("input") ?: JSONObject()
+        if (toolName == ASK_USER_QUESTION_TOOL) {
+            val question = parseAskUserQuestion(requestId, sessionId, input)
+            if (question == null) {
+                writeControl(controlDeny(requestId, "The question had nothing to show the user."))
+                return
+            }
+            controlRequests[requestId] = PendingControl(sessionId, toolName, input)
+            eventBus.emit(RuntimeEvent.QuestionAsked(sessionId, question))
+            pushForegroundProgress("Claude has a question for you")
+        } else {
+            controlRequests[requestId] = PendingControl(sessionId, toolName, input)
+            eventBus.emit(RuntimeEvent.ToolRequested(sessionId, toolPermissionRequest(requestId, sessionId, toolName, input)))
+            pushForegroundProgress("Claude is waiting for your approval")
+        }
+    }
+
+    /** Claude Code withdrew a prompt, e.g. because the turn was interrupted. */
+    private suspend fun cancelControlRequest(sessionId: String, json: JSONObject) {
+        val requestId = json.optString("request_id")
+        val control = controlRequests.remove(requestId) ?: return
+        eventBus.emit(
+            if (control.toolName == ASK_USER_QUESTION_TOOL) RuntimeEvent.QuestionAnswered(sessionId, requestId, null)
+            else RuntimeEvent.ToolRejected(sessionId, requestId),
+        )
+    }
+
+    /** Writes one line to Claude Code's stdin; false when the process is gone. */
+    private fun writeControl(line: String): Boolean = synchronized(stdinLock) {
+        val stdin = activeStdin ?: return@synchronized false
+        runCatching {
+            stdin.write((line + "\n").toByteArray())
+            stdin.flush()
+        }.onFailure { Log.w("ClaudeBridge", "Could not write to Claude Code", it) }.isSuccess
+    }
+
+    private fun closeStdin() = synchronized(stdinLock) {
+        runCatching { activeStdin?.close() }
+        activeStdin = null
     }
 
     override suspend fun stopSession(sessionId: String) = withContext(Dispatchers.IO) {
@@ -455,8 +589,10 @@ class ClaudeRuntimeBridge(
     private suspend fun consumeClaudeJsonEvent(sessionId: String, json: JSONObject) {
         when (json.optString("type")) {
             "stream_event" -> json.optJSONObject("event")?.let { consumeClaudeJsonEvent(sessionId, it) }
+            "control_request" -> handleControlRequest(sessionId, json)
+            "control_cancel_request" -> cancelControlRequest(sessionId, json)
             "system" -> when (json.optString("subtype")) {
-                "init" -> Unit
+                "init" -> rememberCapabilities(json)
                 "thinking_tokens" -> emitReasoningProgress(sessionId, json.optInt("estimated_tokens"))
                 "permission_denied" -> eventBus.emit(
                     RuntimeEvent.RuntimeLog(
@@ -658,7 +794,8 @@ class ClaudeRuntimeBridge(
             .take(600)
     }
 
-    private fun buildContextPrompt(currentPrompt: String, history: List<ChatMessage>, guestWorkspacePath: String, projectKind: ProjectKind): String {
+    /** Project instructions and recent history, followed by [currentPrompt] when there is one. */
+    private fun buildContextPrompt(currentPrompt: String?, history: List<ChatMessage>, guestWorkspacePath: String, projectKind: ProjectKind): String {
         // Filter out the current prompt (last user message), system greeting, and any error messages
         val priorMessages = history
             .filter { msg ->
@@ -690,7 +827,7 @@ class ClaudeRuntimeBridge(
         sb.appendLine("</project_workspace>")
         sb.appendLine()
         if (priorMessages.isEmpty()) {
-            sb.appendLine(currentPrompt)
+            currentPrompt?.let(sb::appendLine)
             return sb.toString()
         }
         sb.appendLine("<conversation_history>")
@@ -708,11 +845,48 @@ class ClaudeRuntimeBridge(
             sb.appendLine()
         }
         sb.appendLine("</conversation_history>")
+        if (currentPrompt == null) return sb.toString()
         sb.appendLine()
         sb.appendLine("Now, respond to this new message from the user:")
         sb.appendLine(currentPrompt)
         return sb.toString()
     }
+
+    /**
+     * Skills, commands, agents, MCP servers and tools for the command palette:
+     * what the last run in this project reported, or the `.claude` folders on
+     * disk before Claude Code has run there.
+     */
+    suspend fun loadCapabilities(projectId: String): ClaudeCapabilities = withContext(Dispatchers.IO) {
+        readCapabilities(projectId)
+    }
+
+    private fun readCapabilities(projectId: String): ClaudeCapabilities {
+        val onDisk = runCatching {
+            scanClaudeConfigDirs(
+                listOf(
+                    File(ensureWorkspace(projectId), ".claude"),
+                    File(context.filesDir, "runtime/ubuntu/root/.claude"),
+                ),
+            )
+        }.getOrDefault(ClaudeCapabilities())
+        val reported = capabilitiesFile(projectId).takeIf(File::isFile)
+            ?.let { runCatching { claudeCapabilitiesFromJson(it.readText()) }.getOrNull() }
+        return reported?.withDescriptionsFrom(onDisk) ?: onDisk
+    }
+
+    private suspend fun rememberCapabilities(json: JSONObject) {
+        val projectId = activeProjectId ?: return
+        runCatching {
+            val file = capabilitiesFile(projectId)
+            file.parentFile?.mkdirs()
+            file.writeText(parseClaudeInit(json).toJson())
+        }.onFailure { Log.w("ClaudeBridge", "Could not save Claude Code capabilities", it) }
+        capabilityBus.emit(projectId)
+    }
+
+    private fun capabilitiesFile(projectId: String) =
+        File(context.filesDir, "claude-capabilities/${projectId.replace(Regex("[^A-Za-z0-9_-]"), "_")}.json")
 
     private fun ensureWorkspace(projectId: String): File {
         val base = File(context.filesDir, "workspaces/$projectId").apply { mkdirs() }.canonicalFile
@@ -1024,6 +1198,8 @@ class ClaudeRuntimeBridge(
      * block session cleanup forever after the answer was already delivered.
      */
     private fun terminateActiveProcessGracefully() {
+        // Stream-json input keeps Claude Code waiting for another message; end it.
+        closeStdin()
         val running = activeProcess ?: return
         Thread {
             runCatching {
@@ -1077,6 +1253,7 @@ class ClaudeRuntimeBridge(
     }
 
     private data class PendingPermission(val request: ToolRequest, val response: File)
+    private data class PendingControl(val sessionId: String, val toolName: String, val input: JSONObject)
     private class ProviderSessionException(message: String) : IllegalStateException(message)
 
     companion object {
