@@ -108,7 +108,7 @@ target_compile_definitions(proot PRIVATE
 target_compile_options(proot PRIVATE
     -Wall -Wextra -O2
     "SHELL:-include string.h"
-    "SHELL:-include ${SHM_ROOT}/shm.h"
+    "SHELL:-include \"${SHM_ROOT}/shm.h\""
 )
 target_link_options(proot PRIVATE "-Wl,-z,noexecstack")
 target_link_libraries(proot PRIVATE talloc android-shmem)
