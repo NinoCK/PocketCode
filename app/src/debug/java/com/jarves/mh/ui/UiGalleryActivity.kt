@@ -34,19 +34,21 @@ import com.jarves.mh.update.AppUpdateInfo
  * Screens: projects, projects-empty, projects-busy, projects-update, terminal, settings,
  * chat, chat-empty, chat-live, files, project-terminal, preview, loading, setup-permissions,
  * setup-device, setup-install, setup-error, setup-provider, setup-credentials, setup-claude,
- * setup-antigravity.
+ * setup-antigravity. The file and file-edit screens take `--es sample` with one of: kt, py, tsx, html,
+ * css, json, yaml, md, sh, go, rs, big (or bigN for N copies of kt), bigtxt.
  */
 class UiGalleryActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         val screen = intent.getStringExtra("screen") ?: "projects"
+        val sample = intent.getStringExtra("sample") ?: "kt"
         val theme = when (intent.getStringExtra("theme")) {
             "dark" -> AppThemeMode.DARK
             "light" -> AppThemeMode.LIGHT
             else -> AppThemeMode.SYSTEM
         }
-        setContent { PocketTheme(theme) { UiGallery(screen) } }
+        setContent { PocketTheme(theme) { UiGallery(screen, sample) } }
     }
 }
 
@@ -94,7 +96,11 @@ private val sampleTerminal = listOf(
 )
 
 @Composable
-private fun UiGallery(screen: String) {
+private fun UiGallery(screen: String, sample: String) {
+    var editorPreferences by remember { mutableStateOf(com.jarves.mh.ui.editor.EditorPreferences()) }
+    var draft by remember {
+        mutableStateOf(if (screen == "file-edit") androidx.compose.foundation.text.input.TextFieldState(gallerySample(sample).second) else null)
+    }
     val workspaceState = AppUiState(
         projects = sampleProjects,
         activeProject = sampleProjects.first(),
@@ -193,16 +199,13 @@ private fun UiGallery(screen: String) {
                     uploadConflict = com.jarves.mh.model.UploadConflict("app/config", listOf("settings.json"), otherFiles = 2),
                 )
                 "file", "file-edit" -> {
-                    val source = "package com.example.weather\n\nclass WeatherWidget {\n    fun refresh() {\n        // TODO\n    }\n}\n"
+                    val (path, source) = gallerySample(sample)
                     workspaceState.copy(
-                        openedFilePath = "app/src/main/java/com/example/weather/WeatherWidget.kt",
+                        openedFilePath = path,
                         openedFileContent = source,
                         openedFileEditable = true,
-                        fileDraft = if (screen == "file-edit") {
-                            androidx.compose.foundation.text.input.TextFieldState(source.replace("// TODO", "updateViews()"))
-                        } else {
-                            null
-                        },
+                        fileDraft = draft,
+                        editorPreferences = editorPreferences,
                     )
                 }
                 "chat-attachments" -> workspaceState.copy(
@@ -272,6 +275,11 @@ private fun UiGallery(screen: String) {
                 onExtractZip = { _, _, _ -> },
                 onImportZipProject = {},
                 onBuildAndRunAndroid = {},
+                fileActions = FileManagerActions(
+                    onStartEditing = { draft = androidx.compose.foundation.text.input.TextFieldState(gallerySample(sample).second) },
+                    onStopEditing = { draft = null },
+                    onEditorPreferencesChange = { editorPreferences = it },
+                ),
                 initialTab = when (screen) {
                     "files", "files-upload", "files-conflict", "file", "file-edit" -> WorkspaceTab.FILES
                     "project-terminal" -> WorkspaceTab.TERMINAL
@@ -354,4 +362,259 @@ private fun HomeGallery(screen: String, workspaceState: AppUiState) {
             )
         }
     }
+}
+
+
+private const val Q = "\"\"\""
+
+/** Sample files for the file viewer and editor screens, keyed by `--es sample`. */
+private fun gallerySample(name: String): Pair<String, String> {
+    name.removePrefix("big").toIntOrNull()?.let { copies ->
+        val source = gallerySample("kt").second
+        return "app/src/main/java/com/example/weather/Generated$copies.kt" to buildString {
+            repeat(copies) { append("// ---- copy ").append(it).append(" ----\n").append(source) }
+        }
+    }
+    return gallerySampleNamed(name)
+}
+
+private fun gallerySampleNamed(name: String): Pair<String, String> = when (name) {
+    "py" -> "scripts/fetch_weather.py" to """#!/usr/bin/env python3
+${Q}Fetch the forecast and cache it for the widget.${Q}
+import json
+from dataclasses import dataclass
+
+
+@dataclass
+class Forecast:
+    city: str
+    temps: list[float]
+
+    def average(self) -> float:
+        return sum(self.temps) / len(self.temps) if self.temps else 0.0
+
+
+@cache(ttl=600)
+def load(city: str, days: int = 3) -> Forecast:
+    # Ask the API, falling back to the cached copy
+    url = f"https://api.example.com/v1/{city}?days={days}"
+    data = json.loads(fetch(url) or "{}")
+    return Forecast(city, [d["max"] for d in data.get("daily", [])])
+
+
+if __name__ == "__main__":
+    print(load("Lisbon").average(), None, True)
+"""
+    "tsx" -> "web/src/App.tsx" to """import { useState } from "react";
+import type { Forecast } from "./api";
+
+interface Props {
+  city: string;
+  onRefresh?: () => void;
+}
+
+const UNITS = /^(metric|imperial)$/i;
+
+export default function App({ city, onRefresh }: Props) {
+  const [data, setData] = useState<Forecast | null>(null);
+  const label = `Weather in ${'$'}{city.toUpperCase()}`;
+
+  async function refresh() {
+    const res = await fetch(`/api/forecast?city=${'$'}{city}`);
+    setData(await res.json());
+    onRefresh?.();
+  }
+
+  return (
+    <main className="app">
+      <h1>{label}</h1>
+      <Button onClick={refresh} disabled={!data}>
+        Refresh
+      </Button>
+    </main>
+  );
+}
+"""
+    "html" -> "web/index.html" to """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Weather &amp; more</title>
+  <style>
+    body { margin: 0; font-family: system-ui, sans-serif; }
+    .card:hover { box-shadow: 0 2px 8px rgba(0, 0, 0, .2); }
+  </style>
+</head>
+<body>
+  <!-- App root -->
+  <div id="app" class="card" hidden>Loading…</div>
+  <script type="module">
+    const el = document.getElementById("app");
+    el.hidden = false;
+  </script>
+</body>
+</html>
+"""
+    "css" -> "web/src/styles.scss" to """:root {
+  --accent: #f28c52;
+  --gap: 12px;
+}
+
+/* Cards on the dashboard */
+.card {
+  padding: var(--gap) calc(var(--gap) * 2);
+  border-radius: 1.5rem;
+  background: url(images/sky.png) no-repeat;
+
+  &:hover > .title {
+    color: var(--accent) !important;
+  }
+
+  @media (max-width: 600px) {
+    padding: 8px;
+  }
+}
+"""
+    "json" -> "package.json" to """{
+  "name": "weather-web",
+  "version": "1.2.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite --port 5173",
+    "build": "tsc && vite build"
+  },
+  "dependencies": {
+    "react": "^18.3.1"
+  },
+  "workspaces": ["web", "api"],
+  "retries": 3,
+  "sourceMap": null
+}
+"""
+    "yaml" -> ".github/workflows/build.yml" to """name: Build
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest   # pinned image
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          cache: gradle
+      - run: |
+          ./gradlew assembleDebug
+          echo "done"
+"""
+    "md" -> "README.md" to """---
+title: Weather Widget
+---
+# Weather Widget
+
+A **home-screen widget** that shows the _forecast_ for your city.
+
+## Setup
+
+1. Clone the repo
+2. Run `./gradlew installDebug`
+- [x] Dark mode
+- [ ] Hourly view
+
+> Data comes from [Open-Meteo](https://open-meteo.com).
+
+```kotlin
+val widget = WeatherWidget(context)
+widget.refresh()
+```
+"""
+    "sh" -> "scripts/deploy.sh" to """#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="${'$'}{HOME}/apps/weather"  # where builds go
+VERSION=${'$'}(git describe --tags)
+
+deploy() {
+  local target="${'$'}1"
+  echo "Deploying ${'$'}VERSION to ${'$'}{target}"
+  if [[ -z "${'$'}target" ]]; then
+    return 1
+  fi
+  cat <<EOF > "${'$'}APP_DIR/release.txt"
+version=${'$'}VERSION
+EOF
+}
+
+deploy "${'$'}{1:-staging}"
+"""
+    "go" -> "server/main.go" to """package main
+
+import (
+	"fmt"
+	"net/http"
+)
+
+type Server struct {
+	Port int
+}
+
+func (s *Server) Start() error {
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"ok": true}`)
+	})
+	return http.ListenAndServe(fmt.Sprintf(":%d", s.Port), nil)
+}
+"""
+    "rs" -> "src/lib.rs" to """use std::collections::HashMap;
+
+/// Caches forecasts per city.
+#[derive(Debug, Default)]
+pub struct Cache<'a> {
+    items: HashMap<&'a str, f64>,
+}
+
+impl<'a> Cache<'a> {
+    pub fn get(&self, city: &'a str) -> Option<f64> {
+        println!("lookup {}", city);
+        self.items.get(city).copied()
+    }
+}
+"""
+    "bigtxt" -> "notes/generated.txt" to gallerySample("big").second
+    "big" -> "app/src/main/java/com/example/weather/Generated.kt" to buildString {
+        val source = gallerySample("kt").second
+        repeat(220) { append("// ---- copy ").append(it).append(" ----\n").append(source) }
+    }
+    else -> "app/src/main/java/com/example/weather/WeatherWidget.kt" to """package com.example.weather
+
+import android.content.Context
+import androidx.compose.runtime.Composable
+
+/**
+ * Home-screen widget showing today's forecast.
+ */
+@Suppress("unused")
+class WeatherWidget(private val context: Context) {
+    private val cache = mutableMapOf<String, Double>()
+    val maxEntries = 32
+
+    fun refresh(city: String = "Lisbon"): Boolean {
+        val temp = cache[city] ?: return false
+        println("Temperature in ${'$'}city is ${'$'}{temp.toInt()}°C")
+        return temp > 0.5 && city.isNotBlank()
+    }
+
+    // TODO: move to a repository
+    companion object {
+        const val MAX_CITIES = 0x10
+    }
+}
+
+@Composable
+fun WidgetPreview() = WeatherWidget(LocalContext.current)
+"""
 }

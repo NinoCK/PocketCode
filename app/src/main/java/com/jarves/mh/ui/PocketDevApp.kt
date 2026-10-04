@@ -432,6 +432,7 @@ fun PocketDevApp(viewModel: MainViewModel = viewModel()) {
                         onStopEditing = viewModel::stopEditingFile,
                         onSaveEdits = viewModel::saveOpenedFile,
                         onDismissSaveConflict = viewModel::dismissSaveConflict,
+                        onEditorPreferencesChange = viewModel::setEditorPreferences,
                         onDelete = viewModel::deleteWorkspaceEntries,
                         onRename = viewModel::renameWorkspaceEntry,
                         onCreate = viewModel::createWorkspaceEntry,

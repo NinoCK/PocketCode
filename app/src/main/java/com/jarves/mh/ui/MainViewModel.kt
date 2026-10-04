@@ -69,6 +69,7 @@ import com.jarves.mh.runtime.RuntimeSetupStatus
 import com.jarves.mh.runtime.readTailText
 import com.jarves.mh.runtime.supportsArm64Runtime
 import com.jarves.mh.runtime.AndroidAppInstaller
+import com.jarves.mh.ui.editor.EditorPreferences
 import com.jarves.mh.update.AppUpdateInfo
 import com.jarves.mh.update.AppUpdater
 import java.io.File
@@ -179,6 +180,8 @@ data class AppUiState(
     val provider: ProviderProfile = ProviderProfile(ProviderKind.ANTHROPIC),
     val activeApiKeyName: String? = null,
     val themeMode: com.jarves.mh.ui.theme.AppThemeMode = com.jarves.mh.ui.theme.AppThemeMode.SYSTEM,
+    /** Word wrap and text size of the file viewer and editor. */
+    val editorPreferences: EditorPreferences = EditorPreferences(),
     val apiPingStatus: ApiPingStatus = ApiPingStatus.IDLE,
     val apiPingMessage: String? = null,
     val projects: List<Project> = emptyList(),
@@ -398,6 +401,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             claudeEffort = preferences.claudeEffort,
             themeMode = runCatching { com.jarves.mh.ui.theme.AppThemeMode.valueOf(preferences.themeMode.uppercase()) }
                 .getOrDefault(com.jarves.mh.ui.theme.AppThemeMode.SYSTEM),
+            editorPreferences = EditorPreferences(
+                wordWrap = preferences.editorWordWrap,
+                fontSize = preferences.editorFontSize.coerceIn(EditorPreferences.MinFontSize, EditorPreferences.MaxFontSize),
+            ),
             projects = preferences.loadProjects(),
             githubAuthStatus = GitHubAuthStatus.DISCONNECTED,
             githubLogin = preferences.githubLogin.takeIf(String::isNotBlank),
@@ -1027,6 +1034,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setThemeMode(mode: com.jarves.mh.ui.theme.AppThemeMode) {
         preferences.themeMode = mode.name.lowercase()
         _state.update { it.copy(themeMode = mode) }
+    }
+
+    fun setEditorPreferences(value: EditorPreferences) {
+        preferences.editorWordWrap = value.wordWrap
+        preferences.editorFontSize = value.fontSize
+        _state.update { it.copy(editorPreferences = value) }
     }
 
     fun getSavedApiKey(kind: ProviderKind): String = vault.get(kind.name).orEmpty()

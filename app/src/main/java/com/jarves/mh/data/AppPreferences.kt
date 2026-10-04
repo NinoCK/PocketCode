@@ -103,6 +103,16 @@ class AppPreferences(private val context: Context) {
         get() = preferences.getString("theme_mode", "system") ?: "system"
         set(value) { preferences.edit().putString("theme_mode", value).apply() }
 
+    /** File viewer and editor: wrap long lines. */
+    var editorWordWrap: Boolean
+        get() = preferences.getBoolean("editor_word_wrap", true)
+        set(value) { preferences.edit().putBoolean("editor_word_wrap", value).apply() }
+
+    /** File viewer and editor text size, in sp. */
+    var editorFontSize: Float
+        get() = preferences.getFloat("editor_font_size", 13f)
+        set(value) { preferences.edit().putFloat("editor_font_size", value).apply() }
+
     var legacySeededCredentialRemoved: Boolean
         get() = preferences.getBoolean("legacy_seeded_credential_removed", false)
         set(value) { preferences.edit().putBoolean("legacy_seeded_credential_removed", value).apply() }

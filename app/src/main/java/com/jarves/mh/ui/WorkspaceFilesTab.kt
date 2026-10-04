@@ -147,6 +147,7 @@ import com.jarves.mh.model.FileUploadState
 import com.jarves.mh.model.UploadConflict
 import com.jarves.mh.model.UploadConflictChoice
 import com.jarves.mh.model.WorkspaceEntry
+import com.jarves.mh.ui.editor.EditorPreferences
 import com.jarves.mh.ui.theme.PocketBlue
 import com.jarves.mh.ui.theme.PocketGreen
 import com.jarves.mh.ui.theme.PocketOrange
@@ -168,6 +169,7 @@ data class FileManagerActions(
     val onStopEditing: () -> Unit = {},
     val onSaveEdits: (overwrite: Boolean) -> Unit = {},
     val onDismissSaveConflict: () -> Unit = {},
+    val onEditorPreferencesChange: (EditorPreferences) -> Unit = {},
     val onDelete: (paths: List<String>) -> Unit = {},
     val onRename: (path: String, newName: String) -> Unit = { _, _ -> },
     val onCreate: (parentDir: String, name: String, isDirectory: Boolean) -> Unit = { _, _, _ -> },

@@ -392,6 +392,7 @@ internal fun WorkspaceScreen(
                 draft = state.fileDraft,
                 saving = state.fileSaving,
                 saveConflict = state.fileSaveConflict,
+                preferences = state.editorPreferences,
                 onClose = {
                     onCloseFile()
                     selectedTab = WorkspaceTab.FILES
@@ -400,6 +401,7 @@ internal fun WorkspaceScreen(
                 onStopEditing = fileActions.onStopEditing,
                 onSave = fileActions.onSaveEdits,
                 onDismissSaveConflict = fileActions.onDismissSaveConflict,
+                onPreferencesChange = fileActions.onEditorPreferencesChange,
             )
             return@AnimatedContent
         }
