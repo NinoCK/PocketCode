@@ -15,11 +15,17 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.VisibilityThreshold
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
+import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.ScrollState
@@ -117,6 +123,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -131,8 +138,11 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.graphics.shapes.RoundedPolygon
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import com.jarves.mh.BuildConfig
 import com.jarves.mh.model.AgentKind
 import com.jarves.mh.model.DSH_PROTOCOL_PROVIDERS
@@ -200,41 +210,8 @@ private fun SetupScaffold(
     Scaffold(
         modifier = modifier.imePadding(),
         containerColor = MaterialTheme.colorScheme.surface,
-        topBar = {
-            TopAppBar(
-                title = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        BrandMark(size = 32.dp)
-                        Spacer(Modifier.width(10.dp))
-                        Text("Mobile Harness", style = MaterialTheme.typography.titleMedium)
-                    }
-                },
-                navigationIcon = {
-                    if (onBack != null) IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") }
-                },
-                actions = {
-                    if (onToggleTheme != null) {
-                        IconButton(onClick = onToggleTheme) {
-                            Icon(if (LocalDarkTheme.current) Icons.Rounded.LightMode else Icons.Rounded.DarkMode, "Toggle theme")
-                        }
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
-            )
-        },
-        bottomBar = {
-            if (actions != null) {
-                Column(
-                    Modifier
-                        .fillMaxWidth()
-                        .background(MaterialTheme.colorScheme.surface)
-                        .navigationBarsPadding()
-                        .padding(start = 24.dp, end = 24.dp, top = 8.dp, bottom = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
-                    content = actions,
-                )
-            }
-        },
+        topBar = { SetupTopBar(onBack, onToggleTheme) },
+        bottomBar = { if (actions != null) SetupActionBar(actions) },
     ) { padding ->
         Column(
             Modifier
@@ -283,10 +260,82 @@ private fun SetupScaffold(
     }
 }
 
+/** Brand title bar shared by every first-run screen. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SetupTopBar(onBack: (() -> Unit)?, onToggleTheme: (() -> Unit)?) {
+    TopAppBar(
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                BrandMark(size = 32.dp)
+                Spacer(Modifier.width(10.dp))
+                Text("Mobile Harness", style = MaterialTheme.typography.titleMedium)
+            }
+        },
+        navigationIcon = {
+            AnimatedVisibility(onBack != null, enter = fadeIn() + scaleIn(initialScale = 0.6f), exit = fadeOut()) {
+                IconButton(onClick = { onBack?.invoke() }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") }
+            }
+        },
+        actions = {
+            if (onToggleTheme != null) {
+                IconButton(onClick = onToggleTheme) {
+                    Icon(if (LocalDarkTheme.current) Icons.Rounded.LightMode else Icons.Rounded.DarkMode, "Toggle theme")
+                }
+            }
+        },
+        colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
+    )
+}
+
+/** Actions pinned to the bottom of a first-run screen, above the navigation bar. */
+@Composable
+private fun SetupActionBar(actions: @Composable ColumnScope.() -> Unit) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surface)
+            .navigationBarsPadding()
+            .padding(start = 24.dp, end = 24.dp, top = 8.dp, bottom = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+        content = actions,
+    )
+}
+
+/** Static hero, eyebrow, headline and subtitle at the top of a first-run page. */
+@Composable
+private fun SetupPageHeader(
+    title: String,
+    heroIcon: ImageVector,
+    heroPolygon: RoundedPolygon,
+    subtitle: String? = null,
+    eyebrow: String? = null,
+) {
+    ShapeBadge(
+        icon = heroIcon,
+        polygon = heroPolygon,
+        size = 72.dp,
+        container = MaterialTheme.colorScheme.primaryContainer,
+        content = MaterialTheme.colorScheme.onPrimaryContainer,
+        spinning = true,
+    )
+    Spacer(Modifier.height(20.dp))
+    if (eyebrow != null) {
+        Text(eyebrow, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+        Spacer(Modifier.height(4.dp))
+    }
+    Text(title, style = MaterialTheme.typography.headlineLarge)
+    if (subtitle != null) {
+        Spacer(Modifier.height(8.dp))
+        Text(subtitle, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+    Spacer(Modifier.height(24.dp))
+}
+
 /** Segmented step progress: the current segment is slightly thicker. */
 @Composable
-private fun StepProgress(step: Int, count: Int) {
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+private fun StepProgress(step: Int, count: Int, modifier: Modifier = Modifier) {
+    Row(modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
         repeat(count) { index ->
             val color by animateColorAsState(
                 if (index <= step) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceContainerHighest,
@@ -512,11 +561,24 @@ internal fun StartupErrorScreen(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Background permissions
+// Welcome + background permissions
 // ---------------------------------------------------------------------------------------------
 
+private enum class WelcomePage { WELCOME, NOTIFICATIONS, BATTERY }
+
+/**
+ * First-run welcome flow: a welcome page, then the two settings that keep coding tasks running in
+ * the background. Pages slide horizontally in the direction of travel.
+ *
+ * No separate step is needed for keeping the CPU awake during a task: WAKE_LOCK is an install-time
+ * permission and [RuntimeExecutionService] takes and releases the wake lock on its own.
+ */
 @Composable
-internal fun BackgroundTaskSetupScreen(onToggleTheme: () -> Unit = {}, onContinue: () -> Unit) {
+internal fun BackgroundTaskSetupScreen(
+    showWelcome: Boolean = true,
+    onToggleTheme: () -> Unit = {},
+    onContinue: () -> Unit,
+) {
     val context = LocalContext.current
     val powerManager = context.getSystemService(PowerManager::class.java)
     fun notificationsAllowed(): Boolean {
@@ -526,130 +588,240 @@ internal fun BackgroundTaskSetupScreen(onToggleTheme: () -> Unit = {}, onContinu
     }
     fun batteryUnrestricted(): Boolean = powerManager.isIgnoringBatteryOptimizations(context.packageName)
 
-    var currentStep by rememberSaveable { mutableIntStateOf(0) }
+    val pages = remember(showWelcome) {
+        if (showWelcome) WelcomePage.entries.toList() else listOf(WelcomePage.NOTIFICATIONS, WelcomePage.BATTERY)
+    }
+    var pageIndex by rememberSaveable { mutableIntStateOf(0) }
+    val page = pages[pageIndex.coerceIn(pages.indices)]
     var notificationGranted by remember { mutableStateOf(notificationsAllowed()) }
     var batteryGranted by remember { mutableStateOf(batteryUnrestricted()) }
-    var notificationDenied by rememberSaveable { mutableStateOf(false) }
-    var taskProtectionConfirmed by rememberSaveable { mutableStateOf(false) }
 
-    val notificationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+    fun refresh() {
         notificationGranted = notificationsAllowed()
-        notificationDenied = !granted
-        if (notificationGranted) currentStep = 1
+        batteryGranted = batteryUnrestricted()
     }
+    fun next() {
+        if (pageIndex < pages.lastIndex) pageIndex += 1 else onContinue()
+    }
+    // Catches changes made from the notification shade or Settings outside the buttons below.
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { refresh() }
+    BackHandler(enabled = pageIndex > 0) { pageIndex -= 1 }
+
     val notificationSettingsLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
-        notificationGranted = notificationsAllowed()
-        if (notificationGranted) currentStep = 1
+        refresh()
+        if (notificationGranted) {
+            // Created only once notifications are allowed: for apps targeting API 32 or lower,
+            // creating a channel is what makes Android 13+ show its own permission prompt.
+            RuntimeExecutionService.ensureNotificationChannels(context)
+            RuntimeSetupService.ensureNotificationChannel(context)
+            if (page == WelcomePage.NOTIFICATIONS) next()
+        }
     }
     val batteryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
-        batteryGranted = batteryUnrestricted()
-        if (batteryGranted) currentStep = 2
-    }
-    LaunchedEffect(Unit) {
-        notificationGranted = notificationsAllowed()
-        batteryGranted = batteryUnrestricted()
+        refresh()
+        if (batteryGranted && page == WelcomePage.BATTERY) next()
     }
 
-    val steps = listOf(
-        Triple(Icons.Rounded.Notifications, "Task notifications", "See live progress and get an alert when your agent finishes or needs you."),
-        Triple(Icons.Rounded.BatterySaver, "Background reliability", "Let Mobile Harness keep working when you lock the phone or switch apps."),
-        Triple(Icons.Rounded.Shield, "Task protection", "Keep the CPU awake only while a visible coding task runs, then release it automatically."),
-    )
-    val privacyNotes = listOf(
-        "Only task progress, completion, and error notifications are sent.",
-        "You stay in control and can stop every task from its notification.",
-        "The screen stays off. Protection is capped at 90 minutes and stops with the task.",
-    )
-    val granted = listOf(notificationGranted, batteryGranted, taskProtectionConfirmed)
-    val (icon, title, description) = steps[currentStep]
+    // The system permission dialog is skipped on purpose. Sideloaded builds target API 28, where
+    // Android 13+ answers a POST_NOTIFICATIONS request with an instant denial and no dialog, so the
+    // button goes straight to this app's notification settings on every build.
+    fun openNotificationSettings() {
+        runCatching {
+            notificationSettingsLauncher.launch(
+                Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName),
+            )
+        }.onFailure {
+            notificationSettingsLauncher.launch(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}")))
+        }
+    }
+    fun openBatterySettings() {
+        runCatching { batteryLauncher.launch(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
+            .onFailure {
+                batteryLauncher.launch(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}")))
+            }
+    }
 
-    SetupScaffold(
-        title = title,
-        subtitle = description,
-        eyebrow = "Step ${currentStep + 1} of 3 · Prepare for reliable setup",
-        heroIcon = icon,
-        heroPolygon = MaterialShapes.Clover4Leaf,
-        step = currentStep,
-        onBack = if (currentStep > 0) ({ currentStep -= 1 }) else null,
-        onToggleTheme = onToggleTheme,
-        actions = {
-            SetupPrimaryButton(
-                text = when (currentStep) {
-                    0 -> if (notificationGranted) "Next" else if (notificationDenied) "Open notification settings" else "Allow notifications"
-                    1 -> if (batteryGranted) "Next" else "Open battery settings"
-                    else -> "Enable and finish"
-                },
-                onClick = {
-                    when (currentStep) {
-                        0 -> when {
-                            notificationGranted -> currentStep = 1
-                            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !notificationDenied -> {
-                                // Targets below API 33 can tie notification prompts to channel
-                                // creation, so channels are created only after this explicit tap.
-                                RuntimeExecutionService.ensureNotificationChannels(context)
-                                RuntimeSetupService.ensureNotificationChannel(context)
-                                notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                            }
-                            else -> notificationSettingsLauncher.launch(
-                                Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName),
+    val permissionOffset = if (showWelcome) 1 else 0
+    fun permissionEyebrow(target: WelcomePage) = "Step ${pages.indexOf(target) - permissionOffset + 1} of 2 · Permissions"
+
+    Scaffold(
+        containerColor = MaterialTheme.colorScheme.surface,
+        topBar = { SetupTopBar(onBack = if (pageIndex > 0) ({ pageIndex -= 1 }) else null, onToggleTheme = onToggleTheme) },
+        bottomBar = {
+            SetupActionBar {
+                AnimatedContent(
+                    targetState = page,
+                    transitionSpec = { fadeIn(tween(210, delayMillis = 90)).togetherWith(fadeOut(tween(90))) },
+                    label = "welcomeActions",
+                ) { actionsPage ->
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        when (actionsPage) {
+                            WelcomePage.WELCOME -> SetupPrimaryButton(text = "Get started", onClick = ::next)
+                            WelcomePage.NOTIFICATIONS -> SetupPrimaryButton(
+                                text = if (notificationGranted) "Next" else "Turn on notifications",
+                                icon = if (notificationGranted) Icons.AutoMirrored.Rounded.ArrowForward else null,
+                                onClick = { if (notificationGranted) next() else openNotificationSettings() },
+                            )
+                            WelcomePage.BATTERY -> SetupPrimaryButton(
+                                text = if (batteryGranted) "Finish" else "Open battery settings",
+                                icon = if (batteryGranted) Icons.Rounded.Check else null,
+                                onClick = { if (batteryGranted) next() else openBatterySettings() },
                             )
                         }
-                        1 -> if (batteryGranted) {
-                            currentStep = 2
-                        } else {
-                            runCatching { batteryLauncher.launch(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
-                                .onFailure {
-                                    batteryLauncher.launch(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}")))
-                                }
-                        }
-                        else -> {
-                            taskProtectionConfirmed = true
-                            onContinue()
+                        // Fixed height so the page area never resizes when the secondary action changes.
+                        Box(Modifier.fillMaxWidth().height(48.dp), contentAlignment = Alignment.Center) {
+                            when {
+                                actionsPage == WelcomePage.WELCOME -> Text(
+                                    "Takes less than a minute",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                actionsPage == WelcomePage.NOTIFICATIONS && !notificationGranted ->
+                                    TextButton(onClick = ::next, modifier = Modifier.fillMaxWidth()) { Text("Continue without notifications") }
+                                actionsPage == WelcomePage.BATTERY && !batteryGranted ->
+                                    TextButton(onClick = ::next, modifier = Modifier.fillMaxWidth()) { Text("Continue without battery exemption") }
+                            }
                         }
                     }
-                },
-            )
-            AnimatedVisibility(currentStep < 2 && !granted[currentStep]) {
-                TextButton(onClick = { currentStep += 1 }, modifier = Modifier.fillMaxWidth()) {
-                    Text(if (currentStep == 0) "Continue without notifications" else "Continue without battery exemption")
                 }
             }
         },
-    ) {
-        steps.forEachIndexed { index, (stepIcon, stepTitle, _) ->
-            val done = granted[index]
-            ChoiceRow(
-                index = index,
-                count = steps.size,
-                selected = index == currentStep,
-                headline = stepTitle,
-                supporting = when {
-                    done -> "Done"
-                    index == currentStep -> "Required now"
-                    else -> "Up next"
-                },
-                onClick = null,
-                leading = { IconTile(stepIcon) },
-                control = {
-                    if (done) {
-                        Icon(Icons.Rounded.Check, "Complete", Modifier.padding(end = 8.dp), tint = LocalPocketExtraColors.current.success)
+    ) { padding ->
+        Column(Modifier.fillMaxSize().padding(padding)) {
+            StepProgress(pageIndex, pages.size, Modifier.padding(start = 24.dp, end = 24.dp, top = 4.dp))
+            AnimatedContent(
+                targetState = pageIndex,
+                modifier = Modifier.weight(1f).fillMaxWidth().clipToBounds(),
+                transitionSpec = {
+                    // Push/pop: the page further along the flow always sits on top and travels the
+                    // full width, while the page beneath shifts a quarter-width and fades.
+                    val forward = targetState > initialState
+                    val slide = spring(stiffness = Spring.StiffnessMediumLow, visibilityThreshold = IntOffset.VisibilityThreshold)
+                    val fade = tween<Float>(durationMillis = 300)
+                    val transform = if (forward) {
+                        slideInHorizontally(slide) { width -> width }
+                            .togetherWith(slideOutHorizontally(slide) { width -> -width / 4 } + fadeOut(fade))
+                    } else {
+                        (slideInHorizontally(slide) { width -> -width / 4 } + fadeIn(fade))
+                            .togetherWith(slideOutHorizontally(slide) { width -> width })
                     }
+                    transform.apply { targetContentZIndex = targetState.toFloat() }
                 },
-            )
+                label = "welcomePage",
+            ) { index ->
+                Column(
+                    Modifier
+                        .fillMaxSize()
+                        .background(MaterialTheme.colorScheme.surface)
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 24.dp),
+                ) {
+                    Spacer(Modifier.height(24.dp))
+                    when (pages[index]) {
+                        WelcomePage.WELCOME -> WelcomePageContent()
+                        WelcomePage.NOTIFICATIONS -> PermissionPageContent(
+                            eyebrow = permissionEyebrow(WelcomePage.NOTIFICATIONS),
+                            title = "Task notifications",
+                            subtitle = "See live progress and get an alert when your agent finishes or needs you.",
+                            heroIcon = Icons.Rounded.Notifications,
+                            current = 0,
+                            notificationGranted = notificationGranted,
+                            batteryGranted = batteryGranted,
+                            hint = "Turn on “Allow notifications” on the next screen, then come back.".takeUnless { notificationGranted },
+                            note = "Only task progress, completion and error notifications are sent, and you can stop any task from its notification.",
+                        )
+                        WelcomePage.BATTERY -> PermissionPageContent(
+                            eyebrow = permissionEyebrow(WelcomePage.BATTERY),
+                            title = "Background reliability",
+                            subtitle = "Let Mobile Harness keep working when you lock the phone or switch apps.",
+                            heroIcon = Icons.Rounded.BatterySaver,
+                            current = 1,
+                            notificationGranted = notificationGranted,
+                            batteryGranted = batteryGranted,
+                            hint = "Find Mobile Harness on the next screen and set it to “Not optimized” or “Unrestricted”, then come back."
+                                .takeUnless { batteryGranted },
+                            note = "While a task runs, only the processor stays awake, never the screen. It is released when the task ends, after 90 minutes at most, and needs no extra permission.",
+                        )
+                    }
+                    Spacer(Modifier.height(24.dp))
+                }
+            }
         }
-        Spacer(Modifier.height(16.dp))
-        Row(verticalAlignment = Alignment.Top) {
-            Icon(Icons.Rounded.Shield, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-            Spacer(Modifier.width(8.dp))
-            Text(privacyNotes[currentStep], style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        Spacer(Modifier.height(12.dp))
-        Text(
-            "You can change these settings later. Android may still stop exceptionally heavy work when the device is low on memory.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
+    }
+}
+
+@Composable
+private fun WelcomePageContent() {
+    SetupPageHeader(
+        title = "Welcome to Mobile Harness",
+        subtitle = "A complete coding workspace in your pocket. AI agents, a real Linux terminal and your projects, all running on this phone.",
+        eyebrow = "Welcome",
+        heroIcon = Icons.Rounded.Terminal,
+        heroPolygon = MaterialShapes.Cookie9Sided,
+    )
+    GroupedRow(0, 3, "AI coding agents", supporting = "Pick an agent and let it build, fix and explain code inside your projects.", icon = Icons.Rounded.SmartToy)
+    GroupedRow(1, 3, "A real Linux terminal", supporting = "Ubuntu with Node.js, Git and the toolchains you choose.", icon = Icons.Rounded.Terminal)
+    GroupedRow(2, 3, "Works in the background", supporting = "Lock your phone and get notified when a task finishes.", icon = Icons.Rounded.Notifications)
+    Spacer(Modifier.height(16.dp))
+    Text(
+        "Next, two quick settings keep your tasks running while Mobile Harness is off screen.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+@Composable
+private fun PermissionPageContent(
+    eyebrow: String,
+    title: String,
+    subtitle: String,
+    heroIcon: ImageVector,
+    current: Int,
+    notificationGranted: Boolean,
+    batteryGranted: Boolean,
+    hint: String?,
+    note: String,
+) {
+    SetupPageHeader(title = title, subtitle = subtitle, eyebrow = eyebrow, heroIcon = heroIcon, heroPolygon = MaterialShapes.Clover4Leaf)
+    val permissions = listOf(
+        Triple(Icons.Rounded.Notifications, "Task notifications", notificationGranted),
+        Triple(Icons.Rounded.BatterySaver, "Background reliability", batteryGranted),
+    )
+    permissions.forEachIndexed { index, (icon, headline, done) ->
+        ChoiceRow(
+            index = index,
+            count = permissions.size,
+            selected = index == current,
+            headline = headline,
+            supporting = when {
+                done -> "Done"
+                index == current -> "Required now"
+                index < current -> "Skipped"
+                else -> "Up next"
+            },
+            onClick = null,
+            leading = { IconTile(icon) },
+            control = {
+                if (done) Icon(Icons.Rounded.Check, "Complete", Modifier.padding(end = 8.dp), tint = LocalPocketExtraColors.current.success)
+            },
         )
     }
+    if (hint != null) {
+        Spacer(Modifier.height(16.dp))
+        Text(hint, style = MaterialTheme.typography.bodyMedium)
+    }
+    Spacer(Modifier.height(16.dp))
+    Row(verticalAlignment = Alignment.Top) {
+        Icon(Icons.Rounded.Shield, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.width(8.dp))
+        Text(note, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+    Spacer(Modifier.height(12.dp))
+    Text(
+        "You can change these settings later. Android may still stop exceptionally heavy work when the device is low on memory.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
+    )
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -326,6 +326,8 @@ fun PocketDevApp(viewModel: MainViewModel = viewModel()) {
                 onToggleTheme = rememberThemeToggle(viewModel),
             )
             AppDestination.BACKGROUND_SETUP -> BackgroundTaskSetupScreen(
+                // Users updating from a build without this flow already know the app.
+                showWelcome = !state.onboardingComplete,
                 onToggleTheme = rememberThemeToggle(viewModel),
                 onContinue = viewModel::finishBackgroundSetup,
             )
