@@ -276,6 +276,28 @@ data class FileExportState(
     val documentUri: String? = null,
 )
 
+/** What to do with uploaded files whose names are already taken in the target folder. */
+enum class UploadConflictChoice { REPLACE, KEEP_BOTH, SKIP }
+
+/**
+ * Files picked for upload into [directory] (root-relative) that clash with existing files, waiting
+ * for the user's [UploadConflictChoice]. [otherFiles] counts the picked files that don't clash.
+ */
+data class UploadConflict(val directory: String, val existingNames: List<String>, val otherFiles: Int)
+
+/** Progress of copying picked documents into a project folder from the Files tab. */
+data class FileUploadState(
+    val id: Long,
+    /** Root-relative folder receiving the files ("" = project root). */
+    val directory: String,
+    val fileName: String,
+    val filesDone: Int = 0,
+    val filesTotal: Int,
+    val bytesDone: Long = 0,
+    /** Sum of the sizes the documents reported; 0 when none did. */
+    val bytesTotal: Long = 0,
+)
+
 enum class RiskLevel { SAFE, REVIEW, HIGH }
 
 /**
@@ -376,7 +398,14 @@ data class ChatAttachment(
     val relativePath: String,
     val mimeType: String,
     val sizeBytes: Long,
-)
+) {
+    /** A folder in the project (an extracted ZIP) rather than a copied file. */
+    val isDirectory: Boolean get() = mimeType == DIRECTORY_MIME_TYPE
+
+    companion object {
+        const val DIRECTORY_MIME_TYPE = "inode/directory"
+    }
+}
 
 data class ProjectChat(
     val id: String = UUID.randomUUID().toString(),

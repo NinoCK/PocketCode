@@ -9,6 +9,8 @@ import android.provider.OpenableColumns
 import android.os.SystemClock
 import android.os.Build
 import android.system.Os
+import androidx.compose.foundation.text.input.TextFieldState
+import androidx.compose.ui.text.TextRange
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.core.content.ContextCompat
@@ -35,6 +37,10 @@ import com.jarves.mh.model.ToolRequest
 import com.jarves.mh.model.WorkspaceEntry
 import com.jarves.mh.model.FileExportPhase
 import com.jarves.mh.model.FileExportState
+import com.jarves.mh.model.FileUploadState
+import com.jarves.mh.model.UploadConflict
+import com.jarves.mh.model.UploadConflictChoice
+import com.jarves.mh.data.WorkspaceArchiveImport
 import com.jarves.mh.data.WorkspaceFileOps
 import com.jarves.mh.model.projectSlug
 import com.jarves.mh.model.generateQuickChatIdentity
@@ -71,8 +77,6 @@ import java.net.UnknownHostException
 import java.net.URI
 import java.nio.file.Files
 import java.util.UUID
-import java.util.zip.ZipEntry
-import java.util.zip.ZipInputStream
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -157,6 +161,9 @@ private data class ImportedZipProject(
     val sourceAttachment: ChatAttachment,
 )
 
+/** A document picked for upload in the Files tab; [sizeBytes] is -1 when the provider doesn't say. */
+private data class PendingUpload(val uri: Uri, val name: String, val sizeBytes: Long)
+
 data class AppUiState(
     val startupStage: StartupStage = StartupStage.CHECKING,
     val startupProgress: Float = 0f,
@@ -207,10 +214,27 @@ data class AppUiState(
     val openedFilePath: String? = null,
     val openedFileContent: String? = null,
     val fileContentLoading: Boolean = false,
+    val openedFileBinary: Boolean = false,
+    val openedFileEditable: Boolean = false,
+    /** Why the opened file is read-only or cut off (binary, too large, not UTF-8), or why it failed to load. */
+    val openedFileNotice: String? = null,
+    /**
+     * Unsaved text while the opened file is being edited; null when it is only viewed. It lives
+     * here rather than in the screen so edits survive rotation, and is too large for saved state.
+     */
+    val fileDraft: TextFieldState? = null,
+    val fileSaving: Boolean = false,
+    /** The opened file changed on disk after it was loaded; saving waits for the user to confirm. */
+    val fileSaveConflict: Boolean = false,
+    /** Picked uploads that clash with existing files, waiting for the user's choice. */
+    val uploadConflict: UploadConflict? = null,
+    val fileUpload: FileUploadState? = null,
     val messages: List<ChatMessage> = listOf(
         ChatMessage(fromUser = false, text = "Hi! Tell me what you want to build or change."),
     ),
     val pendingAttachments: List<ChatAttachment> = emptyList(),
+    /** Progress line while a chat-attached ZIP is extracted into the project; null when idle. */
+    val archiveExtractionMessage: String? = null,
     val pendingApproval: ToolRequest? = null,
     val changes: List<ChangeItem> = emptyList(),
     val activity: List<ActivityItem> = emptyList(),
@@ -220,7 +244,6 @@ data class AppUiState(
     val taskStartedAtMillis: Long? = null,
     val taskFinishedAtMillis: Long? = null,
     val workSegmentStartedAtMillis: Long? = null,
-    val currentTaskRequest: String? = null,
     val previewReady: Boolean = false,
     val previewUrl: String? = null,
     val isRunning: Boolean = false,
@@ -273,7 +296,25 @@ data class AppUiState(
     val appUpdateDownloadedBytes: Long = 0L,
     val appUpdateTotalBytes: Long = -1L,
     val appUpdateError: String? = null,
-)
+) {
+    /**
+     * A prompt is in flight but the runtime has not reported anything visible yet. The chat shows
+     * a plain status row for this gap; it is never presented or saved as agent reasoning.
+     */
+    val awaitingAgent: Boolean
+        get() = isRunning && liveProcess.isEmpty() && !liveThinking && messages.lastOrNull()?.fromUser == true
+
+    /**
+     * Why project files can't be renamed, deleted, created or uploaded by hand right now, or null.
+     * The agent's own edits and its change review must not race the user's.
+     */
+    val fileChangesBlockedReason: String?
+        get() = when {
+            isRunning -> "Wait for the agent to finish before changing files"
+            fileUpload != null -> "Wait for the upload to finish"
+            else -> null
+        }
+}
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val vault = ApiKeyVault(application)
@@ -309,6 +350,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     @Volatile private var githubAuthProcess: Process? = null
     private var githubAuthJob: kotlinx.coroutines.Job? = null
     private var exportJob: Job? = null
+    private var openFileJob: Job? = null
+    private var uploadJob: Job? = null
+    /** On-disk state and line endings of the opened file when it was loaded or last saved. */
+    private var openedFileStamp: WorkspaceFileOps.FileStamp? = null
+    private var openedFileCrlf = false
+    /** Picked documents waiting for the user to resolve [AppUiState.uploadConflict]. */
+    private var pendingUploads: List<PendingUpload> = emptyList()
     @Volatile private var lastOpenedAntigravityAuthUrl: String? = null
     @Volatile private var lastOpenedClaudeAuthUrl: String? = null
     private var activeRuntimeRequest: RuntimeRetryRequest? = null
@@ -2053,6 +2101,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
+        // An upload belongs to the project being closed; don't keep writing into it unseen.
+        uploadJob?.cancel()
+        pendingUploads = emptyList()
         _state.update {
             it.copy(
                 activeProject = null,
@@ -2063,6 +2114,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 workspaceFiles = emptyList(),
                 workspaceCurrentDir = "",
                 workspaceSelection = emptyMap(),
+                uploadConflict = null,
                 workspaceArtifacts = emptyList(),
                 androidProjectDetected = false,
                 filesLoading = false,
@@ -2239,47 +2291,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val projectId = UUID.randomUUID().toString()
         val destination = File(app.filesDir, "workspaces/$projectId")
         destination.mkdirs()
-        val destinationPath = destination.canonicalFile.toPath()
         val availableLimit = (destination.usableSpace * 8L / 10L).coerceAtMost(MAX_IMPORTED_PROJECT_BYTES)
-        var extractedBytes = 0L
-        var entries = 0
         try {
             val source = resolver.openInputStream(uri) ?: error("The selected ZIP could not be opened")
-            source.buffered().use { input ->
-                ZipInputStream(input).use { zip ->
-                    while (true) {
-                        val entry = zip.nextEntry ?: break
-                        entries++
-                        require(entries <= MAX_IMPORTED_ZIP_ENTRIES) { "The ZIP contains too many files" }
-                        val entryName = entry.name.replace('\\', '/').trimStart('/')
-                        require(entryName.isNotBlank() && '\u0000' !in entryName) { "The ZIP contains an invalid path" }
-                        if (entryName.startsWith("__MACOSX/") || entryName.endsWith("/.DS_Store") || entryName == ".DS_Store") {
-                            zip.closeEntry()
-                            continue
-                        }
-                        val target = File(destination, entryName).canonicalFile
-                        require(target.toPath().startsWith(destinationPath)) { "The ZIP contains an unsafe path" }
-                        if (entry.isDirectory) {
-                            target.mkdirs()
-                        } else {
-                            target.parentFile?.mkdirs()
-                            target.outputStream().buffered().use { output ->
-                                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                                while (true) {
-                                    val count = zip.read(buffer)
-                                    if (count < 0) break
-                                    extractedBytes += count
-                                    require(extractedBytes <= availableLimit) { "The extracted project is too large for available storage" }
-                                    output.write(buffer, 0, count)
-                                }
-                            }
-                            if (entry.time > 0) target.setLastModified(entry.time)
-                        }
-                        zip.closeEntry()
-                    }
-                }
+            val extractedBytes = source.use {
+                WorkspaceArchiveImport.unzipInto(it, destination, availableLimit, MAX_IMPORTED_ZIP_ENTRIES).totalBytes
             }
-            require(entries > 0 && destination.walkTopDown().any { it.isFile }) { "The ZIP does not contain project files" }
             val preliminary = Project(
                 id = projectId,
                 name = identity.displayName,
@@ -3073,31 +3090,381 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun openFile(entry: WorkspaceEntry) {
+    fun openFile(entry: WorkspaceEntry) = loadOpenedFile(entry, edit = false)
+
+    /** Opens [entry] straight in the editor, or read-only with the reason when it can't be edited. */
+    fun editFile(entry: WorkspaceEntry) = loadOpenedFile(entry, edit = true)
+
+    private fun loadOpenedFile(entry: WorkspaceEntry, edit: Boolean) {
         if (entry.isDirectory) return
         val project = _state.value.activeProject ?: return
-        _state.update { it.copy(openedFilePath = entry.path, openedFileContent = null, fileContentLoading = true) }
-        viewModelScope.launch {
-            val content = withContext(Dispatchers.IO) {
-                val file = File(projectWorkspaceRoot(project), entry.path)
-                runCatching {
-                    if (file.length() > 512_000L) {
-                        file.inputStream().use { stream ->
-                            val buf = ByteArray(512_000)
-                            val read = stream.read(buf)
-                            String(buf, 0, read)
-                        } + "\n\n[File truncated — too large to display fully]"
-                    } else {
-                        file.readText()
-                    }
-                }.getOrElse { "Could not read file: ${it.message}" }
+        openFileJob?.cancel()
+        openedFileStamp = null
+        _state.update { it.withOpenedFile(entry.path).copy(fileContentLoading = true) }
+        openFileJob = viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { WorkspaceFileOps.readTextFile(projectWorkspaceRoot(project), entry.path) }
             }
-            _state.update { it.copy(openedFileContent = content, fileContentLoading = false) }
+            val current = _state.value
+            if (current.openedFilePath != entry.path || current.activeProject?.id != project.id) return@launch
+            val file = result.getOrNull()
+            openedFileStamp = file?.stamp
+            openedFileCrlf = file?.crlf == true
+            _state.update {
+                it.copy(
+                    openedFileContent = file?.text,
+                    fileContentLoading = false,
+                    openedFileBinary = file?.binary == true,
+                    openedFileEditable = file != null && file.readOnlyReason == null,
+                    openedFileNotice = file?.readOnlyReason ?: result.exceptionOrNull()?.let { error -> "Could not read file: ${error.message}" },
+                )
+            }
+            if (edit) startEditingFile()
         }
     }
 
     fun closeFile() {
-        _state.update { it.copy(openedFilePath = null, openedFileContent = null, fileContentLoading = false) }
+        openFileJob?.cancel()
+        _state.update { it.withOpenedFile(null) }
+    }
+
+    /** The file viewer showing [path] (closed for null) with nothing left over from the previous file. */
+    private fun AppUiState.withOpenedFile(path: String?) = copy(
+        openedFilePath = path,
+        openedFileContent = null,
+        fileContentLoading = false,
+        openedFileBinary = false,
+        openedFileEditable = false,
+        openedFileNotice = null,
+        fileDraft = null,
+        fileSaving = false,
+        fileSaveConflict = false,
+    )
+
+    fun startEditingFile() {
+        val current = _state.value
+        val content = current.openedFileContent ?: return
+        if (!current.openedFileEditable || current.fileDraft != null) return
+        if (current.isRunning) {
+            _state.update { it.copy(toastMessage = "Wait for the agent to finish before editing files") }
+            return
+        }
+        _state.update { it.copy(fileDraft = TextFieldState(content, TextRange.Zero)) }
+    }
+
+    /** Leaves the editor and drops unsaved text; the screen asks first when there is any. */
+    fun stopEditingFile() {
+        _state.update { it.copy(fileDraft = null, fileSaveConflict = false) }
+    }
+
+    /**
+     * Writes the editor's text to the opened file. If the file changed on disk since it was loaded
+     * (the agent or a terminal command touched it), nothing is written until the user confirms
+     * with [overwrite].
+     */
+    fun saveOpenedFile(overwrite: Boolean = false) {
+        val current = _state.value
+        val project = current.activeProject ?: return
+        val path = current.openedFilePath ?: return
+        val draft = current.fileDraft ?: return
+        if (current.fileSaving) return
+        if (current.isRunning) {
+            _state.update { it.copy(toastMessage = "Wait for the agent to finish before saving") }
+            return
+        }
+        val text = draft.text.toString()
+        val expected = openedFileStamp
+        val crlf = openedFileCrlf
+        _state.update { it.copy(fileSaving = true, fileSaveConflict = false) }
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val root = projectWorkspaceRoot(project)
+                    if (!overwrite && WorkspaceFileOps.stampOf(root, path) != expected) {
+                        null
+                    } else {
+                        WorkspaceFileOps.writeTextFile(root, path, text, crlf)
+                    }
+                }
+            }
+            val sameFile = _state.value.let { it.openedFilePath == path && it.activeProject?.id == project.id }
+            val stamp = result.getOrNull()
+            if (sameFile && stamp != null) openedFileStamp = stamp
+            val name = path.substringAfterLast('/')
+            _state.update { state ->
+                val done = state.copy(fileSaving = false)
+                when {
+                    result.isFailure -> done.copy(toastMessage = "Couldn't save $name: ${result.exceptionOrNull()?.message ?: "unknown error"}")
+                    stamp == null -> done.copy(fileSaveConflict = sameFile)
+                    sameFile -> done.copy(openedFileContent = text, toastMessage = "Saved $name")
+                    else -> done.copy(toastMessage = "Saved $name")
+                }
+            }
+            if (stamp != null && _state.value.activeProject?.id == project.id) refreshProjectFiles()
+        }
+    }
+
+    fun dismissSaveConflict() {
+        _state.update { it.copy(fileSaveConflict = false) }
+    }
+
+    /** Permanently deletes files and folders picked in the Files tab; folders go with their contents. */
+    fun deleteWorkspaceEntries(paths: List<String>) {
+        val current = _state.value
+        val project = current.activeProject ?: return
+        if (paths.isEmpty()) return
+        current.fileChangesBlockedReason?.let { reason ->
+            _state.update { it.copy(toastMessage = reason) }
+            return
+        }
+        viewModelScope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                runCatching { WorkspaceFileOps.delete(projectWorkspaceRoot(project), paths) }
+                    .getOrElse { WorkspaceFileOps.DeleteResult(deleted = emptyList(), failed = paths) }
+            }
+            fun gone(path: String) = outcome.deleted.any { path == it || path.startsWith("$it/") }
+            fun label(paths: List<String>) = paths.singleOrNull()?.substringAfterLast('/') ?: "${paths.size} items"
+            _state.update { state ->
+                if (state.activeProject?.id != project.id) return@update state
+                state.copy(
+                    workspaceSelection = state.workspaceSelection.filterKeys { !gone(it) },
+                    pendingAttachments = state.pendingAttachments.filterNot { gone(it.relativePath) },
+                    toastMessage = when {
+                        outcome.failed.isEmpty() -> "Deleted ${label(outcome.deleted)}"
+                        outcome.deleted.isEmpty() -> "Couldn't delete ${label(outcome.failed)}"
+                        else -> "Deleted ${label(outcome.deleted)} · couldn't delete ${label(outcome.failed)}"
+                    },
+                )
+            }
+            if (_state.value.activeProject?.id == project.id) refreshProjectFiles()
+        }
+    }
+
+    /** Renames a file or folder in place; ticked paths and pending attachments inside it follow along. */
+    fun renameWorkspaceEntry(path: String, newName: String) {
+        val current = _state.value
+        val project = current.activeProject ?: return
+        current.fileChangesBlockedReason?.let { reason ->
+            _state.update { it.copy(toastMessage = reason) }
+            return
+        }
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { WorkspaceFileOps.rename(projectWorkspaceRoot(project), path, newName) }
+            }
+            if (_state.value.activeProject?.id != project.id) return@launch
+            result.onSuccess { newPath ->
+                fun moved(old: String): String? = when {
+                    old == path -> newPath
+                    old.startsWith("$path/") -> newPath + old.substring(path.length)
+                    else -> null
+                }
+                _state.update { state ->
+                    state.copy(
+                        workspaceSelection = state.workspaceSelection.entries.associate { (key, entry) ->
+                            val target = moved(key) ?: return@associate key to entry
+                            target to entry.copy(path = target, name = target.substringAfterLast('/'))
+                        },
+                        pendingAttachments = state.pendingAttachments.map { attachment ->
+                            moved(attachment.relativePath)?.let { attachment.copy(relativePath = it) } ?: attachment
+                        },
+                        toastMessage = "Renamed to ${newPath.substringAfterLast('/')}",
+                    )
+                }
+            }.onFailure { error ->
+                _state.update { it.copy(toastMessage = error.message ?: "Couldn't rename ${path.substringAfterLast('/')}") }
+            }
+            refreshProjectFiles()
+        }
+    }
+
+    /** Creates an empty folder, or an empty file that opens straight in the editor, inside [parentDir]. */
+    fun createWorkspaceEntry(parentDir: String, name: String, isDirectory: Boolean) {
+        val current = _state.value
+        val project = current.activeProject ?: return
+        current.fileChangesBlockedReason?.let { reason ->
+            _state.update { it.copy(toastMessage = reason) }
+            return
+        }
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { WorkspaceFileOps.create(projectWorkspaceRoot(project), parentDir, name, isDirectory) }
+            }
+            if (_state.value.activeProject?.id != project.id) return@launch
+            result.onSuccess { path ->
+                val created = path.substringAfterLast('/')
+                if (isDirectory) {
+                    _state.update { it.copy(toastMessage = "Created folder $created") }
+                } else {
+                    editFile(WorkspaceEntry(path = path, name = created, isDirectory = false, depth = path.count { it == '/' }))
+                }
+            }.onFailure { error ->
+                _state.update { it.copy(toastMessage = error.message ?: "Couldn't create $name") }
+            }
+            refreshProjectFiles()
+        }
+    }
+
+    /**
+     * Copies documents picked in the Files tab into [directory] (root-relative). When some names
+     * are already taken there, the user picks what to do through [AppUiState.uploadConflict] first.
+     */
+    fun uploadToWorkspace(uris: List<Uri>, directory: String) {
+        val current = _state.value
+        val project = current.activeProject ?: return
+        if (uris.isEmpty() || current.uploadConflict != null) return
+        current.fileChangesBlockedReason?.let { reason ->
+            _state.update { it.copy(toastMessage = reason) }
+            return
+        }
+        val resolver = getApplication<Application>().contentResolver
+        viewModelScope.launch {
+            val (picked, clashing) = withContext(Dispatchers.IO) {
+                val picked = uris.map { uri ->
+                    var displayName: String? = null
+                    var size = -1L
+                    runCatching {
+                        resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+                            if (cursor.moveToFirst()) {
+                                cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME).takeIf { it >= 0 && !cursor.isNull(it) }
+                                    ?.let { displayName = cursor.getString(it) }
+                                cursor.getColumnIndex(OpenableColumns.SIZE).takeIf { it >= 0 && !cursor.isNull(it) }
+                                    ?.let { size = cursor.getLong(it) }
+                            }
+                        }
+                    }
+                    PendingUpload(uri, WorkspaceFileOps.sanitizeFileName(displayName ?: uri.lastPathSegment.orEmpty()), size)
+                }
+                val folder = runCatching { WorkspaceFileOps.resolveInside(projectWorkspaceRoot(project), directory) }.getOrNull()
+                picked to picked.map { it.name }.distinct().filter { name -> folder != null && File(folder, name).isFile }
+            }
+            if (_state.value.activeProject?.id != project.id) return@launch
+            if (clashing.isEmpty()) {
+                startUpload(project, directory, picked, UploadConflictChoice.KEEP_BOTH)
+            } else {
+                pendingUploads = picked
+                _state.update {
+                    it.copy(uploadConflict = UploadConflict(directory, clashing, otherFiles = picked.count { item -> item.name !in clashing }))
+                }
+            }
+        }
+    }
+
+    /** Continues the upload waiting on [AppUiState.uploadConflict]; null cancels it. */
+    fun resolveUploadConflict(choice: UploadConflictChoice?) {
+        val conflict = _state.value.uploadConflict ?: return
+        val picked = pendingUploads
+        pendingUploads = emptyList()
+        _state.update { it.copy(uploadConflict = null) }
+        val project = _state.value.activeProject ?: return
+        if (choice != null) startUpload(project, conflict.directory, picked, choice)
+    }
+
+    fun cancelUpload() {
+        uploadJob?.cancel()
+    }
+
+    private fun startUpload(project: Project, directory: String, picked: List<PendingUpload>, choice: UploadConflictChoice) {
+        if (picked.isEmpty() || uploadJob?.isActive == true) return
+        val uploadId = SystemClock.elapsedRealtime()
+        val bytesTotal = picked.sumOf { it.sizeBytes.coerceAtLeast(0L) }
+        _state.update {
+            it.copy(
+                fileUpload = FileUploadState(
+                    id = uploadId,
+                    directory = directory,
+                    fileName = picked.first().name,
+                    filesTotal = picked.size,
+                    bytesTotal = bytesTotal,
+                ),
+            )
+        }
+
+        fun publish(transform: (FileUploadState) -> FileUploadState) {
+            _state.update { state ->
+                val upload = state.fileUpload?.takeIf { it.id == uploadId } ?: return@update state
+                state.copy(fileUpload = transform(upload))
+            }
+        }
+
+        val resolver = getApplication<Application>().contentResolver
+        var uploaded = 0
+        var skipped = 0
+        val failures = mutableListOf<String>()
+        uploadJob = viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    val checkActive = { coroutineContext.ensureActive() }
+                    val root = projectWorkspaceRoot(project)
+                    val folder = WorkspaceFileOps.uploadFolder(root, directory)
+                    require(bytesTotal <= folder.usableSpace) { "Not enough free space for ${formatMegabytes(bytesTotal)}" }
+                    // Names written by this batch, so two picked files with one name never overwrite each other.
+                    val taken = mutableSetOf<String>()
+                    var bytesBefore = 0L
+                    var lastPublish = 0L
+                    picked.forEachIndexed { index, item ->
+                        checkActive()
+                        val clashes = item.name !in taken && File(folder, item.name).isFile
+                        if (clashes && choice == UploadConflictChoice.SKIP) {
+                            skipped++
+                            return@forEachIndexed
+                        }
+                        val name = if (clashes && choice == UploadConflictChoice.REPLACE) item.name else WorkspaceFileOps.uniqueName(folder, item.name, taken)
+                        taken += name
+                        publish { it.copy(fileName = name, filesDone = index, bytesDone = bytesBefore) }
+                        var copied = 0L
+                        try {
+                            val target = WorkspaceFileOps.childForWrite(root, directory, name)
+                            val input = resolver.openInputStream(item.uri) ?: error("it couldn't be opened")
+                            input.use { stream ->
+                                WorkspaceFileOps.writeStream(target, stream, checkActive) { bytes ->
+                                    copied = bytes
+                                    val now = SystemClock.elapsedRealtime()
+                                    if (now - lastPublish >= EXPORT_PROGRESS_INTERVAL_MS) {
+                                        lastPublish = now
+                                        publish { it.copy(bytesDone = bytesBefore + bytes) }
+                                    }
+                                }
+                            }
+                            uploaded++
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (error: Exception) {
+                            failures += "${item.name} (${error.message ?: "upload failed"})"
+                        }
+                        bytesBefore += if (item.sizeBytes >= 0) item.sizeBytes else copied
+                    }
+                }
+                val where = directory.ifEmpty { "the project root" }
+                _state.update {
+                    it.copy(
+                        toastMessage = buildString {
+                            append(
+                                when (uploaded) {
+                                    0 -> "Nothing uploaded"
+                                    1 -> "Uploaded 1 file to $where"
+                                    else -> "Uploaded $uploaded files to $where"
+                                },
+                            )
+                            if (skipped > 0) append(" · skipped $skipped")
+                            when (failures.size) {
+                                0 -> Unit
+                                1 -> append(" · couldn't upload ${failures.single()}")
+                                else -> append(" · ${failures.size} failed, e.g. ${failures.first()}")
+                            }
+                        },
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                _state.update { it.copy(toastMessage = "Upload cancelled" + if (uploaded > 0) " · $uploaded uploaded" else "") }
+                throw cancelled
+            } catch (error: Throwable) {
+                _state.update { it.copy(toastMessage = "Upload failed: ${error.message ?: "unknown error"}") }
+            } finally {
+                _state.update { state -> if (state.fileUpload?.id == uploadId) state.copy(fileUpload = null) else state }
+                if (_state.value.activeProject?.id == project.id) refreshProjectFiles()
+            }
+        }
     }
 
 
@@ -3133,15 +3500,83 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * Extracts a ZIP picked in chat into the open project under [parentDir] (root-relative) and
+     * attaches the resulting folder to the next message. See [WorkspaceArchiveImport.extractIntoProject]
+     * for how [merge] changes the layout.
+     */
+    fun extractZipIntoWorkspace(uri: Uri, parentDir: String, merge: Boolean) {
+        val current = _state.value
+        val project = current.activeProject ?: return
+        val chatId = current.activeChatId ?: return
+        if (current.isRunning || current.archiveExtractionMessage != null) return
+        val resolver = getApplication<Application>().contentResolver
+        val archiveName = runCatching {
+            resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME).takeIf { it >= 0 }?.let(cursor::getString) else null
+            }
+        }.getOrNull() ?: "archive.zip"
+        _state.update { it.copy(archiveExtractionMessage = "Extracting $archiveName…") }
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val root = projectWorkspaceRoot(project)
+                    WorkspaceArchiveImport.extractIntoProject(
+                        root = root,
+                        parentDir = parentDir,
+                        archiveName = archiveName,
+                        merge = merge,
+                        maxBytes = (root.usableSpace * 8L / 10L).coerceAtMost(MAX_IMPORTED_PROJECT_BYTES),
+                        maxEntries = MAX_IMPORTED_ZIP_ENTRIES,
+                        openStream = { resolver.openInputStream(uri) ?: error("The selected ZIP could not be opened") },
+                        onProgress = { stats ->
+                            _state.update { it.copy(archiveExtractionMessage = "Extracting $archiveName · ${stats.fileCount} files") }
+                        },
+                    )
+                }
+            }
+            result.onSuccess { extracted ->
+                val location = extracted.relativePath.ifEmpty { "the project root" }
+                val replaced = if (extracted.replacedFiles > 0) " (${extracted.replacedFiles} replaced)" else ""
+                _state.update { state ->
+                    // Attach only if the user is still in the same chat and has room for it.
+                    val attach = state.activeProject?.id == project.id && state.activeChatId == chatId &&
+                        state.pendingAttachments.size < MAX_ATTACHMENTS_PER_MESSAGE
+                    val folder = ChatAttachment(
+                        displayName = (if (extracted.relativePath.isEmpty()) archiveName else extracted.relativePath.substringAfterLast('/')).take(120),
+                        relativePath = extracted.relativePath,
+                        mimeType = ChatAttachment.DIRECTORY_MIME_TYPE,
+                        sizeBytes = extracted.totalBytes,
+                    )
+                    state.copy(
+                        archiveExtractionMessage = null,
+                        pendingAttachments = if (attach) state.pendingAttachments + folder else state.pendingAttachments,
+                        toastMessage = "Extracted ${extracted.fileCount} file${if (extracted.fileCount == 1) "" else "s"} to $location$replaced",
+                    )
+                }
+                if (_state.value.activeProject?.id == project.id) refreshProjectFiles()
+            }.onFailure { error ->
+                _state.update {
+                    it.copy(
+                        archiveExtractionMessage = null,
+                        toastMessage = "Extraction failed: ${error.message?.take(180) ?: "Invalid ZIP archive"}",
+                    )
+                }
+            }
+        }
+    }
+
     fun removePendingAttachment(attachmentId: String) {
         val current = _state.value
         val project = current.activeProject ?: return
         val attachment = current.pendingAttachments.firstOrNull { it.id == attachmentId } ?: return
         _state.update { it.copy(pendingAttachments = it.pendingAttachments.filterNot { item -> item.id == attachmentId }) }
+        // Extracted folders are now project files; only the private copy of a picked file is deleted.
+        if (attachment.isDirectory) return
         viewModelScope.launch(Dispatchers.IO) {
             val root = projectWorkspaceRoot(project)
             val file = File(root, attachment.relativePath).canonicalFile
-            if (file.toPath().startsWith(root.canonicalFile.toPath())) file.delete()
+            if (file.isFile && file.toPath().startsWith(root.canonicalFile.toPath())) file.delete()
         }
     }
 
@@ -3173,18 +3608,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 cursor.getColumnIndex(OpenableColumns.SIZE).takeIf { it >= 0 }?.let { declaredSize = cursor.getLong(it) }
             }
         }
+        // Any file type is accepted: the agent reads attachments from the workspace with its own tools.
         val mimeType = resolver.getType(uri).orEmpty().ifBlank { "application/octet-stream" }
-        val extension = displayName.substringAfterLast('.', "").lowercase()
-        val supportedTextExtensions = setOf(
-            "txt", "md", "markdown", "json", "jsonl", "csv", "tsv", "xml", "yaml", "yml", "log",
-            "kt", "kts", "java", "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "html", "htm",
-            "css", "scss", "sass", "less", "c", "cc", "cpp", "h", "hpp", "sh", "bash", "zsh",
-            "gradle", "properties", "toml", "ini", "conf", "sql",
-        )
-        val supported = mimeType.startsWith("image/") ||
-            mimeType.startsWith("text/") || mimeType == "application/json" || mimeType == "application/xml" ||
-            mimeType.endsWith("+json") || mimeType.endsWith("+xml") || extension in supportedTextExtensions
-        require(supported) { "Only images and text files are supported" }
         require(declaredSize <= MAX_ATTACHMENT_BYTES || declaredSize < 0) { "$displayName is larger than 25 MB" }
         val safeName = sanitizeAttachmentName(displayName)
         val root = projectWorkspaceRoot(project).canonicalFile
@@ -3248,13 +3673,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 pendingAttachments = emptyList(),
                 isRunning = true,
                 activity = listOf(ActivityItem("Understanding your request", "Preparing a safe plan", false)) + it.activity,
-                liveProcess = listOf(ActivityItem("Think", requestPlanningSummary(requestText, it.agentKind), false)),
-                liveThinking = true,
+                liveProcess = emptyList(),
+                liveThinking = false,
                 activeThinkingBlockId = null,
                 taskStartedAtMillis = startedAt,
                 taskFinishedAtMillis = null,
                 workSegmentStartedAtMillis = startedAt,
-                currentTaskRequest = requestText,
             )
         }
         touchProject(project.id)
@@ -3265,7 +3689,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             appendLine()
             appendLine("<attached_files>")
             attachments.forEach { attachment ->
-                appendLine("- ${attachment.displayName}: ${projectGuestRoot(project)}/${attachment.relativePath} (${attachment.mimeType})")
+                val path = "${projectGuestRoot(project)}/${attachment.relativePath}".trimEnd('/')
+                if (attachment.isDirectory) {
+                    appendLine("- ${attachment.displayName}: $path/ (folder extracted from a ZIP archive)")
+                } else {
+                    appendLine("- ${attachment.displayName}: $path (${attachment.mimeType})")
+                }
             }
             appendLine("These files were explicitly attached by the user. Inspect them only as needed for the request.")
             appendLine("</attached_files>")
@@ -3365,49 +3794,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             combined.contains("Task completed", true)
     }
 
-    private fun toolPlanSummary(toolName: String, detail: String): String {
-        val clean = detail.replace(Regex("\\s+"), " ").trim()
-        val short = clean.take(90).ifBlank { "the current project" }
-        return when (toolName) {
-            "Write" -> "Preparing to create ${clean.substringAfterLast('/').ifBlank { "a project file" }}"
-            "Edit", "NotebookEdit" -> "Preparing to update ${clean.substringAfterLast('/').ifBlank { "a project file" }}"
-            "Read" -> "Preparing to inspect ${clean.substringAfterLast('/').ifBlank { "a project file" }}"
-            "Glob" -> "Preparing to find matching project files"
-            "Grep" -> "Preparing to search the project for $short"
-            "Bash" -> if (clean.contains("cat ", true) || clean.contains("printf ", true) || clean.contains(" >")) {
-                "Preparing to create or update project files with Bash"
-            } else {
-                "Preparing to run: $short"
-            }
-            else -> "Preparing to use $toolName for the next step"
-        }
-    }
-
-    private fun requestPlanningSummary(
-        request: String,
-        agentKind: AgentKind,
-        toolName: String? = null,
-        detail: String = "",
-    ): String {
-        val agentName = agentKind.title
-        val cleanRequest = request.replace(Regex("\\s+"), " ").trim().take(110)
-        val requestPart = if (cleanRequest.isBlank()) {
-            "$agentName is reviewing the request"
-        } else {
-            "The user is asking: “$cleanRequest”"
-        }
-        return if (toolName == null) {
-            "$requestPart. $agentName is deciding the next useful step."
-        } else {
-            "$requestPart. ${toolPlanSummary(toolName, detail)}."
-        }
-    }
-
     private fun finishWorkSegment(current: AppUiState, finishedAt: Long = System.currentTimeMillis()): AppUiState {
         val meaningfulItems = current.liveProcess.filterNot(::isNoisyRuntimeItem)
             .map { if (it.isComplete) it else it.copy(isComplete = true) }
-        if (!current.liveThinking && meaningfulItems.isEmpty()) {
-            return current.copy(liveProcess = emptyList(), workSegmentStartedAtMillis = null)
+        // Nothing the agent actually reported (e.g. a reply with no reasoning or tools): keep no work
+        // block. The response bubble still carries the task duration.
+        if (meaningfulItems.isEmpty()) {
+            return current.copy(
+                liveProcess = emptyList(),
+                liveThinking = false,
+                activeThinkingBlockId = null,
+                workSegmentStartedAtMillis = null,
+            )
         }
         val startedAt = current.workSegmentStartedAtMillis ?: current.taskStartedAtMillis ?: finishedAt
         val block = ChatMessage(
@@ -3477,29 +3875,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         timeline.copy(messages = timeline.messages + ChatMessage(fromUser = false, text = event.text))
                     }
                 }
-                is RuntimeEvent.ReasoningProgress -> {
-                    val existingIndex = current.liveProcess.indexOfLast { it.title == "Think" }
-                    // The request-level Think summary is seeded once in sendPrompt.
-                    // After that segment has been committed to the timeline, later
-                    // agent turns must not repeat the same request summary.
-                    if (existingIndex < 0) return@update current
-                    val reasoning = ActivityItem(
-                        title = "Think",
-                        detail = current.liveProcess.getOrNull(existingIndex)?.detail
-                            ?: requestPlanningSummary(current.currentTaskRequest.orEmpty(), current.agentKind),
-                        isComplete = false,
-                    )
-                    val process = if (existingIndex >= 0) {
-                        current.liveProcess.toMutableList().also { it[existingIndex] = reasoning }
-                    } else {
-                        current.liveProcess + reasoning
-                    }
-                    current.copy(
-                        liveProcess = process,
-                        liveThinking = true,
-                        workSegmentStartedAtMillis = current.workSegmentStartedAtMillis ?: System.currentTimeMillis(),
-                    )
-                }
+                // Token counts carry no reasoning text, so they only flag that the model is
+                // thinking; no Think step is invented for them.
+                is RuntimeEvent.ReasoningProgress -> current.copy(
+                    liveThinking = true,
+                    workSegmentStartedAtMillis = current.workSegmentStartedAtMillis ?: System.currentTimeMillis(),
+                )
                 is RuntimeEvent.ReasoningSummary -> {
                     val summary = event.summary.trim()
                     val process = current.liveProcess.toMutableList()
@@ -3508,14 +3889,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         process.indices.forEach { index ->
                             if (!process[index].isComplete) process[index] = process[index].copy(isComplete = true)
                         }
-                        val initial = summary.ifBlank { "Thinking…" }
-                        val replaceFallback = current.activeThinkingBlockId == null &&
-                            process.size == 1 && process.first().title == "Think"
-                        if (replaceFallback) {
-                            process[0] = ActivityItem("Think", initial, event.isFinal)
-                        } else {
-                            process += ActivityItem("Think", initial, event.isFinal)
-                        }
+                        process += ActivityItem("Think", summary.ifBlank { "Thinking…" }, event.isFinal)
                     } else if (current.activeThinkingBlockId == event.blockId && existingIndex >= 0 && summary.isNotBlank()) {
                         process[existingIndex] = process[existingIndex].copy(
                             detail = summary,
@@ -3615,7 +3989,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         activity = listOf(ActivityItem("Task completed", "${current.agentKind.title} finished successfully")) +
                             current.activity.map { if (!it.isComplete) it.copy(isComplete = true) else it },
                         taskFinishedAtMillis = finishedAt,
-                        currentTaskRequest = null,
                     )
                 }
                 is RuntimeEvent.SessionFailed -> {
@@ -3637,7 +4010,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         },
                         activity = listOf(ActivityItem("Task stopped", event.reason)) + current.activity,
                         taskFinishedAtMillis = finishedAt,
-                        currentTaskRequest = null,
                     )
                 }
             }
@@ -3713,7 +4085,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val project = current.activeProject ?: return
         val chatId = current.activeChatId ?: return
         val liveItems = if (includeLiveProcess) current.liveProcess.filterNot(::isNoisyRuntimeItem) else emptyList()
-        val messages = if (liveItems.isEmpty() && !current.liveThinking) {
+        val messages = if (liveItems.isEmpty() && !current.liveThinking && !current.awaitingAgent) {
             current.messages
         } else {
             val startedAt = current.workSegmentStartedAtMillis ?: current.taskStartedAtMillis ?: System.currentTimeMillis()
@@ -3757,7 +4129,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private const val EXPORT_PROGRESS_INTERVAL_MS = 80L
         private const val MAX_PROJECT_TERMINAL_HISTORY = 100
         private const val MAX_PROJECT_TERMINAL_OUTPUT = 200_000
-        private const val MAX_ATTACHMENTS_PER_MESSAGE = 5
+        private const val MAX_ATTACHMENTS_PER_MESSAGE = MaxChatAttachments
         private const val MAX_PROCESS_OUTPUT_BYTES = 512 * 1024
         private const val MAX_ATTACHMENT_BYTES = 25L * 1024L * 1024L
         private const val MAX_IMPORTED_PROJECT_BYTES = 8L * 1024L * 1024L * 1024L

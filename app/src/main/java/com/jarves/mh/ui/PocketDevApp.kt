@@ -422,7 +422,24 @@ fun PocketDevApp(viewModel: MainViewModel = viewModel()) {
                 onAddAttachments = viewModel::addChatAttachments,
                 onRemoveAttachment = viewModel::removePendingAttachment,
                 onOpenAttachment = viewModel::openChatAttachment,
+                onExtractZip = viewModel::extractZipIntoWorkspace,
+                onImportZipProject = viewModel::importZipProject,
                 onBuildAndRunAndroid = viewModel::buildAndRunAndroidApp,
+                fileActions = remember(viewModel) {
+                    FileManagerActions(
+                        onEditFile = viewModel::editFile,
+                        onStartEditing = viewModel::startEditingFile,
+                        onStopEditing = viewModel::stopEditingFile,
+                        onSaveEdits = viewModel::saveOpenedFile,
+                        onDismissSaveConflict = viewModel::dismissSaveConflict,
+                        onDelete = viewModel::deleteWorkspaceEntries,
+                        onRename = viewModel::renameWorkspaceEntry,
+                        onCreate = viewModel::createWorkspaceEntry,
+                        onUpload = viewModel::uploadToWorkspace,
+                        onResolveUploadConflict = viewModel::resolveUploadConflict,
+                        onCancelUpload = viewModel::cancelUpload,
+                    )
+                },
             )
             AppDestination.HOME -> RootScreenHost(state, viewModel, projectsListState)
         }

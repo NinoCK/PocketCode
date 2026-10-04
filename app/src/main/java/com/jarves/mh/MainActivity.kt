@@ -2,6 +2,7 @@ package com.jarves.mh
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.addCallback
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.getValue
@@ -15,6 +16,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // Back on a screen with nothing left to close leaves the app the way Home does. Finishing
+        // the activity would clear MainViewModel, which owns running agent sessions and terminal
+        // commands. Registered before setContent, so every Compose BackHandler takes precedence.
+        onBackPressedDispatcher.addCallback(this) { moveTaskToBack(true) }
         setContent {
             val vm: MainViewModel = viewModel()
             val state by vm.state.collectAsStateWithLifecycle()
