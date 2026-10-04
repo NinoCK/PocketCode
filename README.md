@@ -116,7 +116,7 @@ Mobile Harness unites modern **Jetpack Compose UI** with a self-contained **Ubun
     </td>
     <td width="50%" valign="top">
       <h3>Native File Workflow</h3>
-      <p>Browse, edit, search, and attach files directly from the app interface. Interoperate with system storage via Android Storage Access Framework (SAF).</p>
+      <p>Browse, edit, rename, delete, and attach files directly from the app interface, and upload files straight into any project folder. Interoperate with system storage via Android Storage Access Framework (SAF).</p>
     </td>
   </tr>
   <tr>

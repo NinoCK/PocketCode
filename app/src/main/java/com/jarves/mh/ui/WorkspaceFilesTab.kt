@@ -10,6 +10,7 @@ import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContract
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
@@ -55,15 +56,23 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.filled.NoteAdd
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Android
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.DataObject
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.DriveFileRenameOutline
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOff
@@ -72,15 +81,20 @@ import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Terminal
+import androidx.compose.material.icons.filled.Upload
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilledTonalIconButton
@@ -91,9 +105,11 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TriStateCheckbox
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
@@ -106,6 +122,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -113,8 +131,11 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.state.ToggleableState
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -122,6 +143,9 @@ import androidx.compose.ui.unit.sp
 import com.jarves.mh.data.WorkspaceFileOps
 import com.jarves.mh.model.FileExportPhase
 import com.jarves.mh.model.FileExportState
+import com.jarves.mh.model.FileUploadState
+import com.jarves.mh.model.UploadConflict
+import com.jarves.mh.model.UploadConflictChoice
 import com.jarves.mh.model.WorkspaceEntry
 import com.jarves.mh.ui.theme.PocketBlue
 import com.jarves.mh.ui.theme.PocketGreen
@@ -137,11 +161,38 @@ private val PocketRed = Color(0xFFFF7A7A)
 
 private enum class ExportTarget { PROJECT, SELECTION }
 
+/** Callbacks for changing project files by hand from the Files tab and the file editor. */
+data class FileManagerActions(
+    val onEditFile: (WorkspaceEntry) -> Unit = {},
+    val onStartEditing: () -> Unit = {},
+    val onStopEditing: () -> Unit = {},
+    val onSaveEdits: (overwrite: Boolean) -> Unit = {},
+    val onDismissSaveConflict: () -> Unit = {},
+    val onDelete: (paths: List<String>) -> Unit = {},
+    val onRename: (path: String, newName: String) -> Unit = { _, _ -> },
+    val onCreate: (parentDir: String, name: String, isDirectory: Boolean) -> Unit = { _, _, _ -> },
+    val onUpload: (uris: List<Uri>, directory: String) -> Unit = { _, _ -> },
+    /** Null cancels the upload. */
+    val onResolveUploadConflict: (UploadConflictChoice?) -> Unit = {},
+    val onCancelUpload: () -> Unit = {},
+)
+
+private enum class RowAction { EDIT, RENAME, SAVE, DELETE }
+
+/** The dialog open over the Files tab. */
+private sealed interface FileDialog {
+    data class Rename(val entry: WorkspaceEntry) : FileDialog
+    data class Delete(val entries: List<WorkspaceEntry>) : FileDialog
+    data class Create(val isDirectory: Boolean) : FileDialog
+}
+
 /**
  * Project Files page. Folders are browsed one level at a time with a breadcrumb trail; every row
  * has a checkbox so any mix of files and folders can be ticked across folders and exported as a
- * ZIP. The download button beside refresh zips the whole project. Navigation, the selection and export
- * progress live in the ViewModel so they survive opening a file or switching tabs.
+ * ZIP or deleted. The download button beside refresh zips the whole project; the upload button
+ * copies picked files into the folder being shown and "+" creates a file or folder there. Each row's
+ * menu edits, renames, saves or deletes it. Navigation, the selection, export and upload progress
+ * live in the ViewModel so they survive opening a file or switching tabs.
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -166,6 +217,10 @@ internal fun WorkspaceFilesTab(
     onCancelExport: () -> Unit,
     onDismissExport: () -> Unit,
     onOpenExportLocation: () -> Unit,
+    upload: FileUploadState? = null,
+    uploadConflict: UploadConflict? = null,
+    changeBlockedReason: String? = null,
+    actions: FileManagerActions = FileManagerActions(),
 ) {
     val context = LocalContext.current
     val haptics = LocalHapticFeedback.current
@@ -200,6 +255,25 @@ internal fun WorkspaceFilesTab(
         return true
     }
 
+    var dialog by remember { mutableStateOf<FileDialog?>(null) }
+    // The folder shown when the picker opened; the files land there even if the list changed meanwhile.
+    var pendingUploadDir by rememberSaveable { mutableStateOf("") }
+    val uploadLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isNotEmpty()) actions.onUpload(uris, pendingUploadDir)
+    }
+
+    fun changeBlocked(): Boolean {
+        val reason = changeBlockedReason ?: return false
+        Toast.makeText(context, reason, Toast.LENGTH_SHORT).show()
+        return true
+    }
+
+    fun startUpload() {
+        if (changeBlocked()) return
+        pendingUploadDir = currentDir
+        uploadLauncher.launch(arrayOf("*/*"))
+    }
+
     // Everything in this folder may already be included through a ticked ancestor.
     val currentIncludedWith = remember(currentDir, selected) {
         when {
@@ -232,7 +306,7 @@ internal fun WorkspaceFilesTab(
     Box(Modifier.fillMaxSize()) {
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(bottom = if (selection.isEmpty()) 24.dp else 124.dp),
+            contentPadding = PaddingValues(bottom = if (selection.isEmpty() && upload == null) 24.dp else 124.dp),
         ) {
             if (suggestedProjectRoot != null) {
                 item(key = "suggested-root") {
@@ -269,6 +343,8 @@ internal fun WorkspaceFilesTab(
                     canSelectAll = currentIncludedWith == null && entries.isNotEmpty(),
                     onNavigate = onOpenDirectory,
                     onRefresh = onRefresh,
+                    onUpload = ::startUpload,
+                    onCreate = { isDirectory -> if (!changeBlocked()) dialog = FileDialog.Create(isDirectory) },
                     onDownloadProject = { sheet = ExportTarget.PROJECT },
                     onSelectAll = {
                         onSelectionChange(
@@ -283,7 +359,7 @@ internal fun WorkspaceFilesTab(
             }
             when {
                 entries.isEmpty() && loading -> items(6, key = { "skeleton-$it" }) { SkeletonRow(it) }
-                entries.isEmpty() -> item(key = "empty-$currentDir") { EmptyFolder(isRoot = currentDir.isEmpty()) }
+                entries.isEmpty() -> item(key = "empty-$currentDir") { EmptyFolder(isRoot = currentDir.isEmpty(), onUpload = ::startUpload) }
                 else -> items(entries, key = { "entry:${it.path}" }) { entry ->
                     val explicit = entry.path in selected
                     val includedWith = if (explicit) null else WorkspaceFileOps.coveringSelection(entry.path, selected)
@@ -301,13 +377,25 @@ internal fun WorkspaceFilesTab(
                                 onSelectionChange(toggled(selection, entry))
                             }
                         },
+                        onAction = { action ->
+                            when (action) {
+                                // The editor itself explains when the agent is busy or the file can't be edited.
+                                RowAction.EDIT -> actions.onEditFile(entry)
+                                RowAction.RENAME -> if (!changeBlocked()) dialog = FileDialog.Rename(entry)
+                                RowAction.SAVE -> if (!blocked()) {
+                                    pendingSavePath = entry.path
+                                    fileLauncher.launch(entry.name to mimeTypeFor(entry.name))
+                                }
+                                RowAction.DELETE -> if (!changeBlocked()) dialog = FileDialog.Delete(listOf(entry))
+                            }
+                        },
                     )
                 }
             }
         }
 
         AnimatedVisibility(
-            visible = selection.isNotEmpty(),
+            visible = selection.isNotEmpty() && upload == null,
             modifier = Modifier.align(Alignment.BottomCenter),
             enter = slideInVertically(spring(dampingRatio = 0.8f, stiffness = Spring.StiffnessMediumLow)) { it } + fadeIn(),
             exit = slideOutVertically(tween(200)) { it } + fadeOut(tween(160)),
@@ -315,8 +403,22 @@ internal fun WorkspaceFilesTab(
             SelectionBar(
                 selection = selection.values,
                 onClear = { onSelectionChange(emptyMap()) },
+                onDelete = { if (!changeBlocked()) dialog = FileDialog.Delete(selection.values.toList()) },
                 onExport = { sheet = ExportTarget.SELECTION },
             )
+        }
+
+        // Keep the last progress on screen while the bar slides away; quick uploads fade in late
+        // enough that they rarely flash at all.
+        var lastUpload by remember { mutableStateOf(upload) }
+        if (upload != null) lastUpload = upload
+        AnimatedVisibility(
+            visible = upload != null,
+            modifier = Modifier.align(Alignment.BottomCenter),
+            enter = slideInVertically(spring(dampingRatio = 0.8f, stiffness = Spring.StiffnessMediumLow)) { it } + fadeIn(tween(200, delayMillis = 250)),
+            exit = slideOutVertically(tween(200)) { it } + fadeOut(tween(160)),
+        ) {
+            lastUpload?.let { UploadBar(it, projectSlug, onCancel = actions.onCancelUpload) }
         }
 
         ExportOverlay(export = export, onCancel = onCancelExport, onDismiss = onDismissExport, onOpenLocation = onOpenExportLocation)
@@ -348,10 +450,53 @@ internal fun WorkspaceFilesTab(
             },
         )
     }
+
+    when (val open = dialog) {
+        null -> Unit
+        is FileDialog.Rename -> NameDialog(
+            title = if (open.entry.isDirectory) "Rename folder" else "Rename file",
+            icon = Icons.Default.DriveFileRenameOutline,
+            initialName = open.entry.name,
+            confirmLabel = "Rename",
+            takenNames = entries.filter { it.path != open.entry.path }.mapTo(hashSetOf()) { it.name },
+            selectExtension = open.entry.isDirectory,
+            onConfirm = { name ->
+                dialog = null
+                actions.onRename(open.entry.path, name)
+            },
+            onDismiss = { dialog = null },
+        )
+        is FileDialog.Create -> NameDialog(
+            title = if (open.isDirectory) "New folder" else "New file",
+            icon = if (open.isDirectory) Icons.Default.CreateNewFolder else Icons.AutoMirrored.Filled.NoteAdd,
+            initialName = "",
+            confirmLabel = "Create",
+            takenNames = entries.mapTo(hashSetOf()) { it.name },
+            selectExtension = true,
+            supportingText = "In ${currentDir.ifEmpty { projectSlug }}",
+            onConfirm = { name ->
+                dialog = null
+                actions.onCreate(currentDir, name, open.isDirectory)
+            },
+            onDismiss = { dialog = null },
+        )
+        is FileDialog.Delete -> DeleteDialog(
+            entries = open.entries,
+            onConfirm = {
+                dialog = null
+                actions.onDelete(open.entries.map { it.path })
+            },
+            onDismiss = { dialog = null },
+        )
+    }
+
+    uploadConflict?.let { conflict ->
+        UploadConflictDialog(conflict, projectSlug, actions.onResolveUploadConflict)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
-// Folder bar: breadcrumbs, download-project, refresh and "select all"
+// Folder bar: breadcrumbs, new/upload, download-project, refresh and "select all"
 // ---------------------------------------------------------------------------------------------
 
 @Composable
@@ -365,6 +510,8 @@ private fun FolderBar(
     canSelectAll: Boolean,
     onNavigate: (String) -> Unit,
     onRefresh: () -> Unit,
+    onUpload: () -> Unit,
+    onCreate: (isDirectory: Boolean) -> Unit,
     onDownloadProject: () -> Unit,
     onSelectAll: () -> Unit,
 ) {
@@ -372,6 +519,10 @@ private fun FolderBar(
         Column(Modifier.padding(top = 4.dp)) {
             Row(Modifier.padding(start = 8.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 Breadcrumbs(projectSlug, currentDir, onNavigate, Modifier.weight(1f))
+                CreateMenuButton(onCreate)
+                FilledTonalIconButton(onClick = onUpload) {
+                    Icon(Icons.Default.Upload, "Upload files to this folder", Modifier.size(20.dp))
+                }
                 FilledTonalIconButton(onClick = onDownloadProject) {
                     Icon(Icons.Default.Download, "Download project as ZIP", Modifier.size(20.dp))
                 }
@@ -450,6 +601,26 @@ private fun Crumb(icon: ImageVector?, label: String, active: Boolean, onClick: (
 }
 
 @Composable
+private fun CreateMenuButton(onCreate: (isDirectory: Boolean) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        IconButton(onClick = { open = true }) { Icon(Icons.Default.Add, "New file or folder") }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }, shape = RoundedCornerShape(16.dp)) {
+            DropdownMenuItem(
+                text = { Text("New file") },
+                leadingIcon = { Icon(Icons.AutoMirrored.Filled.NoteAdd, null) },
+                onClick = { open = false; onCreate(false) },
+            )
+            DropdownMenuItem(
+                text = { Text("New folder") },
+                leadingIcon = { Icon(Icons.Default.CreateNewFolder, null) },
+                onClick = { open = false; onCreate(true) },
+            )
+        }
+    }
+}
+
+@Composable
 private fun RefreshButton(loading: Boolean, onRefresh: () -> Unit) {
     val transition = rememberInfiniteTransition(label = "refresh")
     val spin by transition.animateFloat(
@@ -483,6 +654,7 @@ private fun FileRow(
     onOpen: () -> Unit,
     onToggle: () -> Unit,
     onLongPress: () -> Unit,
+    onAction: (RowAction) -> Unit,
 ) {
     val background by animateColorAsState(
         if (checked && !includedByParent) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f) else Color.Transparent,
@@ -495,7 +667,7 @@ private fun FileRow(
             .clip(RoundedCornerShape(14.dp))
             .background(background)
             .combinedClickable(onClick = onOpen, onLongClick = onLongPress)
-            .padding(end = 10.dp, top = 2.dp, bottom = 2.dp),
+            .padding(top = 2.dp, bottom = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Checkbox(checked = checked, onCheckedChange = { onToggle() }, enabled = !includedByParent)
@@ -534,12 +706,46 @@ private fun FileRow(
                 }
             }
         }
-        if (entry.isDirectory) {
-            Icon(
-                Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                "Open folder",
-                Modifier.size(20.dp),
-                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+        RowMenu(entry, onAction)
+    }
+}
+
+@Composable
+private fun RowMenu(entry: WorkspaceEntry, onAction: (RowAction) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    fun pick(action: RowAction) {
+        open = false
+        onAction(action)
+    }
+    Box {
+        IconButton(onClick = { open = true }) {
+            Icon(Icons.Default.MoreVert, "Options for ${entry.name}", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }, shape = RoundedCornerShape(16.dp)) {
+            if (!entry.isDirectory) {
+                DropdownMenuItem(
+                    text = { Text("Edit") },
+                    leadingIcon = { Icon(Icons.Default.Edit, null) },
+                    onClick = { pick(RowAction.EDIT) },
+                )
+            }
+            DropdownMenuItem(
+                text = { Text("Rename") },
+                leadingIcon = { Icon(Icons.Default.DriveFileRenameOutline, null) },
+                onClick = { pick(RowAction.RENAME) },
+            )
+            if (!entry.isDirectory) {
+                DropdownMenuItem(
+                    text = { Text("Save to device") },
+                    leadingIcon = { Icon(Icons.Default.SaveAlt, null) },
+                    onClick = { pick(RowAction.SAVE) },
+                )
+            }
+            HorizontalDivider(Modifier.padding(vertical = 4.dp))
+            DropdownMenuItem(
+                text = { Text("Delete", color = MaterialTheme.colorScheme.error) },
+                leadingIcon = { Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error) },
+                onClick = { pick(RowAction.DELETE) },
             )
         }
     }
@@ -603,7 +809,7 @@ private fun SkeletonRow(index: Int) {
 }
 
 @Composable
-private fun EmptyFolder(isRoot: Boolean) {
+private fun EmptyFolder(isRoot: Boolean, onUpload: () -> Unit) {
     Column(
         Modifier.fillMaxWidth().padding(top = 40.dp, start = 28.dp, end = 28.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -619,11 +825,17 @@ private fun EmptyFolder(isRoot: Boolean) {
         if (isRoot) {
             Spacer(Modifier.height(4.dp))
             Text(
-                "Ask your coding agent to create something in this project.",
+                "Ask your coding agent to create something in this project, or upload your own files.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
                 fontSize = 13.sp,
             )
+        }
+        Spacer(Modifier.height(16.dp))
+        OutlinedButton(onClick = onUpload) {
+            Icon(Icons.Default.Upload, null, Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Upload files here")
         }
     }
 }
@@ -692,7 +904,7 @@ private fun BuildOutputsCard(artifacts: List<WorkspaceEntry>, modifier: Modifier
 // ---------------------------------------------------------------------------------------------
 
 @Composable
-private fun SelectionBar(selection: Collection<WorkspaceEntry>, onClear: () -> Unit, onExport: () -> Unit) {
+private fun SelectionBar(selection: Collection<WorkspaceEntry>, onClear: () -> Unit, onDelete: () -> Unit, onExport: () -> Unit) {
     Surface(
         modifier = Modifier.fillMaxWidth().padding(12.dp),
         shape = RoundedCornerShape(24.dp),
@@ -722,6 +934,9 @@ private fun SelectionBar(selection: Collection<WorkspaceEntry>, onClear: () -> U
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+            }
+            IconButton(onClick = onDelete) {
+                Icon(Icons.Default.Delete, "Delete selected", tint = MaterialTheme.colorScheme.error)
             }
             Button(onClick = onExport, contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp)) {
                 Icon(Icons.Default.FolderZip, null, Modifier.size(18.dp))
@@ -834,6 +1049,184 @@ private fun SelectedItemRow(entry: WorkspaceEntry, onRemove: () -> Unit) {
         }
         IconButton(onClick = onRemove) {
             Icon(Icons.Default.Close, "Remove ${entry.name}", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rename, create, delete and upload
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Asks for a file or folder name. Like desktop file managers, renaming a file preselects the name
+ * without its extension unless [selectExtension]. Names in [takenNames] are refused up front.
+ */
+@Composable
+private fun NameDialog(
+    title: String,
+    icon: ImageVector,
+    initialName: String,
+    confirmLabel: String,
+    takenNames: Set<String>,
+    selectExtension: Boolean,
+    onConfirm: (String) -> Unit,
+    onDismiss: () -> Unit,
+    supportingText: String? = null,
+) {
+    val selectionEnd = initialName.lastIndexOf('.').takeIf { it > 0 && !selectExtension } ?: initialName.length
+    var value by remember { mutableStateOf(TextFieldValue(initialName, TextRange(0, selectionEnd))) }
+    val name = value.text.trim()
+    val error = when {
+        name.isEmpty() -> null
+        name in takenNames -> "Something named $name already exists here"
+        else -> WorkspaceFileOps.nameError(name)
+    }
+    val canConfirm = name.isNotEmpty() && error == null && name != initialName
+    val focus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { focus.requestFocus() }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(icon, null) },
+        title = { Text(title) },
+        text = {
+            OutlinedTextField(
+                value = value,
+                onValueChange = { value = it },
+                modifier = Modifier.fillMaxWidth().focusRequester(focus),
+                label = { Text("Name") },
+                singleLine = true,
+                isError = error != null,
+                supportingText = (error ?: supportingText)?.let { message -> { Text(message) } },
+                keyboardOptions = KeyboardOptions(autoCorrectEnabled = false, imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { if (canConfirm) onConfirm(name) }),
+                shape = RoundedCornerShape(16.dp),
+            )
+        },
+        confirmButton = { Button(onClick = { onConfirm(name) }, enabled = canConfirm) { Text(confirmLabel) } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun DeleteDialog(entries: List<WorkspaceEntry>, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    val single = entries.singleOrNull()
+    val folders = entries.count { it.isDirectory }
+    val files = entries.size - folders
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error) },
+        title = { Text(if (single != null) "Delete ${single.name}?" else "Delete ${entries.size} items?") },
+        text = {
+            Text(
+                when {
+                    single?.isDirectory == true -> "The folder and everything inside it will be permanently deleted."
+                    single != null -> "The file will be permanently deleted."
+                    files == 0 -> "These $folders folders and everything inside them will be permanently deleted."
+                    folders == 0 -> "These $files files will be permanently deleted."
+                    else -> "${plural(folders, "folder")} and ${plural(files, "file")} will be permanently deleted, including everything inside the folders."
+                },
+            )
+        },
+        confirmButton = {
+            Button(
+                onClick = onConfirm,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error,
+                    contentColor = MaterialTheme.colorScheme.onError,
+                ),
+            ) { Text("Delete") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+/** Asks what to do with uploads whose names are taken; dismissing cancels the whole upload. */
+@Composable
+private fun UploadConflictDialog(conflict: UploadConflict, projectSlug: String, onChoice: (UploadConflictChoice?) -> Unit) {
+    val names = conflict.existingNames
+    val folder = conflict.directory.ifEmpty { projectSlug }
+    AlertDialog(
+        onDismissRequest = { onChoice(null) },
+        icon = { Icon(Icons.Default.Upload, null) },
+        title = { Text(if (names.size == 1) "Replace ${names.single()}?" else "Replace ${names.size} files?") },
+        text = {
+            Text(
+                buildString {
+                    if (names.size == 1) {
+                        append("A file with this name already exists in $folder.")
+                    } else {
+                        append("These already exist in $folder: ${names.take(4).joinToString()}")
+                        append(if (names.size > 4) " and ${names.size - 4} more." else ".")
+                    }
+                    append(" Keep both saves yours under a new name, like ${numberedName(names.first())}.")
+                    if (conflict.otherFiles > 0) append(" The other ${plural(conflict.otherFiles, "file")} upload either way.")
+                },
+            )
+        },
+        confirmButton = { Button(onClick = { onChoice(UploadConflictChoice.REPLACE) }) { Text("Replace") } },
+        dismissButton = {
+            Row {
+                TextButton(onClick = { onChoice(if (conflict.otherFiles > 0) UploadConflictChoice.SKIP else null) }) {
+                    Text(if (conflict.otherFiles > 0) "Skip" else "Cancel")
+                }
+                TextButton(onClick = { onChoice(UploadConflictChoice.KEEP_BOTH) }) { Text("Keep both") }
+            }
+        },
+    )
+}
+
+@Composable
+private fun UploadBar(upload: FileUploadState, projectSlug: String, onCancel: () -> Unit) {
+    val fraction = when {
+        upload.bytesTotal > 0 -> upload.bytesDone.toFloat() / upload.bytesTotal
+        upload.filesTotal > 0 -> upload.filesDone.toFloat() / upload.filesTotal
+        else -> 0f
+    }.coerceIn(0f, 1f)
+    val animated by animateFloatAsState(fraction, tween(240), label = "uploadProgress")
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(12.dp),
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        tonalElevation = 6.dp,
+        shadowElevation = 14.dp,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)),
+    ) {
+        Column(Modifier.padding(start = 14.dp, end = 6.dp, top = 10.dp, bottom = 14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier.size(36.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(Icons.Default.Upload, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.primary)
+                }
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        "Uploading ${upload.fileName}",
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 14.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        buildString {
+                            if (upload.filesTotal > 1) append("${minOf(upload.filesDone + 1, upload.filesTotal)} of ${upload.filesTotal} · ")
+                            append("to ${upload.directory.ifEmpty { projectSlug }}")
+                        },
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                TextButton(onClick = onCancel) { Text("Cancel") }
+            }
+            Spacer(Modifier.height(10.dp))
+            LinearProgressIndicator(
+                progress = { animated },
+                modifier = Modifier.fillMaxWidth().padding(end = 8.dp).height(6.dp).clip(RoundedCornerShape(3.dp)),
+                drawStopIndicator = {},
+            )
         }
     }
 }
@@ -1090,6 +1483,14 @@ private fun mimeTypeFor(name: String): String {
         "aab" -> "application/octet-stream"
         else -> MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension) ?: "application/octet-stream"
     }
+}
+
+private fun plural(count: Int, noun: String): String = if (count == 1) "1 $noun" else "$count ${noun}s"
+
+/** How "Keep both" renames an upload: `config.json` becomes `config-2.json`, as [WorkspaceFileOps.uniqueName] does. */
+private fun numberedName(name: String): String {
+    val dot = name.lastIndexOf('.')
+    return if (dot > 0) "${name.substring(0, dot)}-2${name.substring(dot)}" else "$name-2"
 }
 
 private fun shortenPath(path: String, max: Int = 46): String =

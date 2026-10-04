@@ -110,6 +110,24 @@ class DshSdkProtocolParserTest {
     }
 
     @Test
+    fun whitespaceLeadingReasoningDeltaDoesNotConsumeBlockStart() {
+        fun delta(text: String) = parser.parseLine(
+            sessionEvent(
+                "assistant/chunk",
+                JSONObject().put("turn", 1).put("step", 1).put(
+                    "chunk",
+                    JSONObject().put("type", "reasoning-delta").put("index", 0).put("text", text),
+                ),
+            ),
+        )
+        val leading = delta("\n")
+        val first = delta("Listing tools")
+
+        assertEquals(DshSdkProtocolEvent.Ignored, leading)
+        assertTrue(first is DshSdkProtocolEvent.Reasoning && first.startsNewBlock && first.text.trim() == "Listing tools")
+    }
+
+    @Test
     fun parsesToolCallResultAndAssistantText() {
         val call = parser.parseLine(sessionEvent("tool/call", JSONObject()
             .put("callId", "call-1").put("name", "bash")

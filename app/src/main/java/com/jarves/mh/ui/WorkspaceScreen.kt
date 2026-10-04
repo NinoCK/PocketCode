@@ -12,6 +12,7 @@ import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
@@ -75,7 +76,6 @@ import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Code
-import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.ExpandLess
@@ -140,16 +140,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -227,13 +225,20 @@ internal fun WorkspaceScreen(
     onAddAttachments: (List<Uri>) -> Unit,
     onRemoveAttachment: (String) -> Unit,
     onOpenAttachment: (ChatAttachment) -> Unit,
+    onExtractZip: (Uri, String, Boolean) -> Unit,
+    onImportZipProject: (Uri) -> Unit,
     onBuildAndRunAndroid: () -> Unit,
+    fileActions: FileManagerActions = FileManagerActions(),
     initialTab: WorkspaceTab = WorkspaceTab.CHAT,
 ) {
     BackHandler(onBack = onBack)
     val context = LocalContext.current
     val keyboardVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
-    val attachmentLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments(), onAddAttachments)
+    val fileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments(), onAddAttachments)
+    val photoLauncher = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(MaxChatAttachments), onAddAttachments)
+    var pendingZip by rememberSaveable { mutableStateOf<Uri?>(null) }
+    val zipLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) pendingZip = uri }
+    var showAttachSheet by rememberSaveable { mutableStateOf(false) }
     val unknownAppsLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || context.packageManager.canRequestPackageInstalls()) {
             onBuildAndRunAndroid()
@@ -244,7 +249,7 @@ internal fun WorkspaceScreen(
     val chatListState = rememberLazyListState()
     var userScrolledUp by rememberSaveable { mutableStateOf(false) }
     val chatItemCount = state.messages.size +
-        (if (state.liveProcess.isNotEmpty() || state.liveThinking) 1 else 0) +
+        (if (state.liveProcess.isNotEmpty() || state.liveThinking || state.awaitingAgent) 1 else 0) +
         (if (state.pendingApproval != null) 1 else 0)
 
     LaunchedEffect(state.activeChatId) {
@@ -272,6 +277,51 @@ internal fun WorkspaceScreen(
 
     var selectedTab by rememberSaveable { mutableStateOf(initialTab) }
     var showChats by rememberSaveable { mutableStateOf(false) }
+    // Folder chips (extracted ZIPs) open in the Files tab; files open in another app.
+    val openAttachment: (ChatAttachment) -> Unit = { attachment ->
+        if (attachment.isDirectory) {
+            selectedTab = WorkspaceTab.FILES
+            onOpenDirectory(attachment.relativePath)
+        } else {
+            onOpenAttachment(attachment)
+        }
+    }
+
+    if (showAttachSheet) {
+        AttachSourceSheet(
+            canAddFiles = state.pendingAttachments.size < MaxChatAttachments,
+            onDismiss = { showAttachSheet = false },
+            onPhotos = {
+                showAttachSheet = false
+                photoLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            },
+            onFiles = {
+                showAttachSheet = false
+                fileLauncher.launch(arrayOf("*/*"))
+            },
+            onZip = {
+                showAttachSheet = false
+                zipLauncher.launch(ZipPickerMimeTypes)
+            },
+        )
+    }
+    pendingZip?.let { uri ->
+        ZipImportSheet(
+            uri = uri,
+            guestRoot = "/workspace/${state.activeProject?.slug.orEmpty()}",
+            filesTabDir = state.workspaceCurrentDir,
+            canImportAsProject = !state.isRunning && !state.projectTerminalRunning && !state.projectImporting,
+            onDismiss = { pendingZip = null },
+            onExtract = { parentDir, merge ->
+                pendingZip = null
+                onExtractZip(uri, parentDir, merge)
+            },
+            onImportAsProject = {
+                pendingZip = null
+                onImportZipProject(uri)
+            },
+        )
+    }
     val activeChat = state.projectChats.firstOrNull { it.id == state.activeChatId }
     val motion = MaterialTheme.motionScheme
 
@@ -336,10 +386,20 @@ internal fun WorkspaceScreen(
                 filePath = openedPath,
                 content = state.openedFileContent,
                 loading = state.fileContentLoading,
+                binary = state.openedFileBinary,
+                notice = state.openedFileNotice,
+                editable = state.openedFileEditable,
+                draft = state.fileDraft,
+                saving = state.fileSaving,
+                saveConflict = state.fileSaveConflict,
                 onClose = {
                     onCloseFile()
                     selectedTab = WorkspaceTab.FILES
                 },
+                onStartEditing = fileActions.onStartEditing,
+                onStopEditing = fileActions.onStopEditing,
+                onSave = fileActions.onSaveEdits,
+                onDismissSaveConflict = fileActions.onDismissSaveConflict,
             )
             return@AnimatedContent
         }
@@ -432,11 +492,13 @@ internal fun WorkspaceScreen(
                         listState = chatListState,
                         taskStartedAtMillis = state.workSegmentStartedAtMillis ?: state.taskStartedAtMillis,
                         thinkingActive = state.liveThinking,
+                        awaitingAgent = state.awaitingAgent,
                         agentKind = state.agentKind,
                         pendingAttachments = state.pendingAttachments,
-                        onAttach = { attachmentLauncher.launch(arrayOf("image/*", "text/*", "application/json", "application/xml")) },
+                        archiveProgress = state.archiveExtractionMessage ?: state.projectImportMessage?.takeIf { state.projectImporting },
+                        onAttach = { showAttachSheet = true },
                         onRemoveAttachment = onRemoveAttachment,
-                        onOpenAttachment = onOpenAttachment,
+                        onOpenAttachment = openAttachment,
                         onRunInTerminal = { command ->
                             selectedTab = WorkspaceTab.TERMINAL
                             onTerminalOpened()
@@ -473,6 +535,10 @@ internal fun WorkspaceScreen(
                         onCancelExport = onCancelExport,
                         onDismissExport = onDismissExport,
                         onOpenExportLocation = onOpenExportLocation,
+                        upload = state.fileUpload,
+                        uploadConflict = state.uploadConflict,
+                        changeBlockedReason = state.fileChangesBlockedReason,
+                        actions = fileActions,
                     )
                     WorkspaceTab.TERMINAL -> TerminalScreen(
                         lines = state.projectTerminalLines,
@@ -631,91 +697,6 @@ private fun ChatSwitcherSheet(
 }
 
 // ---------------------------------------------------------------------------------------------
-// File viewer
-// ---------------------------------------------------------------------------------------------
-
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
-@Composable
-private fun FileViewerScreen(filePath: String, content: String?, loading: Boolean, onClose: () -> Unit) {
-    val fileName = filePath.substringAfterLast('/')
-    val isMarkdown = fileName.substringAfterLast('.', "").equals("md", ignoreCase = true)
-    val clipboard = LocalClipboardManager.current
-    val scope = rememberCoroutineScope()
-    var copied by remember { mutableStateOf(false) }
-
-    Scaffold(
-        containerColor = MaterialTheme.colorScheme.surface,
-        topBar = {
-            TopAppBar(
-                title = { Text(fileName, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                subtitle = { Text(filePath, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                navigationIcon = { IconButton(onClick = onClose) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Close file") } },
-                actions = {
-                    if (!content.isNullOrEmpty()) {
-                        IconButton(onClick = {
-                            clipboard.setText(AnnotatedString(content))
-                            copied = true
-                            scope.launch { delay(2000); copied = false }
-                        }) {
-                            AnimatedContent(targetState = copied, label = "copyIcon") { done ->
-                                Icon(
-                                    if (done) Icons.Rounded.Check else Icons.Rounded.ContentCopy,
-                                    "Copy file contents",
-                                    tint = if (done) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        }
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
-            )
-        },
-    ) { padding ->
-        Box(Modifier.fillMaxSize().padding(padding)) {
-            when {
-                loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { LoadingIndicator(Modifier.size(64.dp)) }
-                content == null -> ExpressiveEmptyState(Icons.Rounded.Description, "No content", "The file could not be read.")
-                isMarkdown -> LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp)) {
-                    item { MarkdownText(markdown = content, color = MaterialTheme.colorScheme.onSurface) }
-                }
-                else -> {
-                    val lines = remember(content) { content.lines() }
-                    Surface(
-                        modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp).padding(bottom = 12.dp),
-                        shape = RoundedCornerShape(24.dp),
-                        color = MaterialTheme.colorScheme.surfaceContainerLow,
-                    ) {
-                        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(vertical = 12.dp)) {
-                            items(lines.size) { index ->
-                                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
-                                    Text(
-                                        "${index + 1}",
-                                        modifier = Modifier.width(48.dp).padding(end = 12.dp),
-                                        fontFamily = FontFamily.Monospace,
-                                        fontSize = 12.sp,
-                                        lineHeight = 19.sp,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
-                                        textAlign = TextAlign.End,
-                                    )
-                                    Text(
-                                        lines[index],
-                                        modifier = Modifier.weight(1f).padding(end = 12.dp),
-                                        fontFamily = FontFamily.Monospace,
-                                        fontSize = 13.sp,
-                                        lineHeight = 19.sp,
-                                        color = MaterialTheme.colorScheme.onSurface,
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
 // Chat
 // ---------------------------------------------------------------------------------------------
 
@@ -745,10 +726,12 @@ internal fun ChatTab(
     onRemoveAttachment: (String) -> Unit,
     onOpenAttachment: (ChatAttachment) -> Unit,
     onRunInTerminal: (String) -> Unit,
+    archiveProgress: String? = null,
     readOnly: Boolean = false,
     readOnlyBlocked: Boolean = false,
     onContinueHere: () -> Unit = {},
     claudeOptions: ClaudeChatOptions? = null,
+    awaitingAgent: Boolean = false,
 ) {
     val view = LocalView.current
     // Keep the screen on while the agent works in this chat; released when it finishes or the tab closes.
@@ -759,7 +742,7 @@ internal fun ChatTab(
     var prompt by rememberSaveable { mutableStateOf("") }
     val chatScope = rememberCoroutineScope()
     val readerAtBottom by remember { derivedStateOf { !listState.canScrollForward } }
-    val showLive = liveProcess.isNotEmpty() || thinkingActive
+    val showLive = liveProcess.isNotEmpty() || thinkingActive || awaitingAgent
     val conversationEmpty = messages.isEmpty() && !showLive && approval == null
 
     Column(Modifier.fillMaxSize().imePadding()) {
@@ -805,6 +788,7 @@ internal fun ChatTab(
                                 running = isRunning,
                                 stopped = false,
                                 thinking = thinkingActive,
+                                idleStatus = "Waiting for ${agentKind.title}",
                                 modifier = Modifier.animateItem(),
                             )
                         }
@@ -860,6 +844,7 @@ internal fun ChatTab(
                 agentName = agentKind.title,
                 isRunning = isRunning,
                 pendingAttachments = pendingAttachments,
+                archiveProgress = archiveProgress,
                 claudeOptions = claudeOptions,
                 onAttach = onAttach,
                 onRemoveAttachment = onRemoveAttachment,
@@ -909,6 +894,7 @@ private fun Composer(
     agentName: String,
     isRunning: Boolean,
     pendingAttachments: List<ChatAttachment>,
+    archiveProgress: String?,
     claudeOptions: ClaudeChatOptions?,
     onAttach: () -> Unit,
     onRemoveAttachment: (String) -> Unit,
@@ -927,6 +913,19 @@ private fun Composer(
                 }
             }
         }
+        AnimatedVisibility(visible = archiveProgress != null) {
+            Row(Modifier.fillMaxWidth().padding(start = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                LoadingIndicator(Modifier.size(24.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    archiveProgress.orEmpty(),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
         if (claudeOptions != null) {
             ClaudeChatOptionsChip(options = claudeOptions, enabled = !isRunning, modifier = Modifier.padding(start = 4.dp, bottom = 6.dp))
         }
@@ -936,10 +935,10 @@ private fun Composer(
             modifier = Modifier.fillMaxWidth().animateContentSize(MaterialTheme.motionScheme.fastSpatialSpec()),
         ) {
             Row(Modifier.fillMaxWidth().padding(6.dp), verticalAlignment = Alignment.Bottom) {
-                IconButton(onClick = onAttach, enabled = !isRunning && pendingAttachments.size < 5) {
+                IconButton(onClick = onAttach, enabled = !isRunning && archiveProgress == null) {
                     Icon(
                         Icons.Rounded.AttachFile,
-                        contentDescription = "Attach files",
+                        contentDescription = "Add photos, files or a ZIP",
                         tint = if (pendingAttachments.isNotEmpty()) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
@@ -1036,7 +1035,11 @@ private fun MessageBubble(
 
 @Composable
 private fun AttachmentChip(attachment: ChatAttachment, onOpen: (() -> Unit)?, onRemove: (() -> Unit)?) {
-    val icon = if (attachment.mimeType.startsWith("image/")) Icons.Rounded.Image else Icons.Rounded.Description
+    val icon = when {
+        attachment.isDirectory -> Icons.Rounded.Folder
+        attachment.mimeType.startsWith("image/") -> Icons.Rounded.Image
+        else -> Icons.Rounded.Description
+    }
     Surface(
         modifier = if (onOpen != null) Modifier.clickable(onClick = onOpen) else Modifier,
         shape = RoundedCornerShape(16.dp),
@@ -1050,7 +1053,11 @@ private fun AttachmentChip(attachment: ChatAttachment, onOpen: (() -> Unit)?, on
             Spacer(Modifier.width(8.dp))
             Column(Modifier.widthIn(max = 180.dp)) {
                 Text(attachment.displayName, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(formatFileSize(attachment.sizeBytes), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    if (attachment.isDirectory) "Folder · ${formatFileSize(attachment.sizeBytes)}" else formatFileSize(attachment.sizeBytes),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
             if (onRemove != null) {
                 IconButton(onClick = onRemove, modifier = Modifier.size(32.dp)) { Icon(Icons.Rounded.Close, "Remove attachment", Modifier.size(16.dp)) }
@@ -1072,6 +1079,7 @@ private fun WorkBlock(
     stopped: Boolean,
     modifier: Modifier = Modifier,
     thinking: Boolean = false,
+    idleStatus: String = "Preparing",
 ) {
     var expanded by rememberSaveable { mutableStateOf(false) }
     val open = running || expanded
@@ -1101,7 +1109,7 @@ private fun WorkBlock(
                 Column(Modifier.weight(1f)) {
                     Text(if (stopped) "Stopped · ${headline.removePrefix("Worked for ")}" else headline, style = MaterialTheme.typography.titleSmall)
                     val preview = when {
-                        thinking && latest == null -> "Analyzing the request"
+                        thinking && latest == null -> "Thinking…"
                         latest != null -> compactActivityText(latest)
                         else -> null
                     }
@@ -1121,8 +1129,9 @@ private fun WorkBlock(
             }
             if (open) {
                 Column(Modifier.padding(start = 8.dp, end = 8.dp, bottom = 8.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    // Harness status, not agent output: nothing here is recorded as a step.
                     if (items.isEmpty()) {
-                        ActivityStepRow(null, if (thinking) "Thinking · Analyzing the request" else "Preparing", inProgress = running)
+                        ActivityStepRow(null, if (thinking) "Thinking…" else "$idleStatus…", inProgress = running)
                     }
                     items.forEachIndexed { index, item ->
                         ActivityStepRow(item, compactActivityText(item), inProgress = running && !item.isComplete && index == items.lastIndex)
@@ -1158,7 +1167,9 @@ private fun ActivityStepRow(item: ActivityItem?, text: String, inProgress: Boole
                 text,
                 modifier = Modifier.weight(1f),
                 style = MaterialTheme.typography.bodyMedium,
-                color = if (inProgress) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+                // A null item is a harness status line; keep it visually apart from agent steps.
+                fontStyle = if (item == null) FontStyle.Italic else null,
+                color = if (inProgress && item != null) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = if (showDetail) Int.MAX_VALUE else 1,
                 overflow = TextOverflow.Ellipsis,
             )

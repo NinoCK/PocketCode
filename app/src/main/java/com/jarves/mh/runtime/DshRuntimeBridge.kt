@@ -894,9 +894,12 @@ internal class DshSdkProtocolParser(private val expectedSessionId: String) {
             }
             "reasoning-delta" -> {
                 val buffer = reasoningByBlock.getOrPut(blockId) { StringBuilder() }
-                val starts = buffer.isEmpty()
+                // A block starts at its first visible text. Whitespace-only leading deltas are
+                // dropped downstream, so marking them as the start would orphan the whole block.
+                val starts = buffer.isBlank()
                 buffer.append(chunk.optString("text"))
-                DshSdkProtocolEvent.Reasoning(blockId, buffer.toString(), starts, isFinal = false)
+                if (buffer.isBlank()) DshSdkProtocolEvent.Ignored
+                else DshSdkProtocolEvent.Reasoning(blockId, buffer.toString(), starts, isFinal = false)
             }
             "block-end" -> {
                 val block = chunk.optJSONObject("block")
@@ -910,8 +913,7 @@ internal class DshSdkProtocolParser(private val expectedSessionId: String) {
                 }
                 if (block?.optString("type") != "reasoning") return DshSdkProtocolEvent.Ignored
                 val text = block.optString("text").ifBlank { reasoningByBlock[blockId]?.toString().orEmpty() }
-                val starts = blockId !in reasoningByBlock
-                reasoningByBlock.remove(blockId)
+                val starts = reasoningByBlock.remove(blockId).isNullOrBlank()
                 if (text.isBlank()) DshSdkProtocolEvent.Ignored
                 else DshSdkProtocolEvent.Reasoning(blockId, text, starts, isFinal = true)
             }

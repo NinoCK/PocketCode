@@ -174,9 +174,49 @@ private fun UiGallery(screen: String) {
             onSelectAgent = {},
             onToggleTheme = {},
         )
-        "chat", "chat-empty", "chat-live", "files", "project-terminal", "preview" -> {
+        "chat", "chat-empty", "chat-live", "chat-attachments", "files", "files-upload", "files-conflict", "file", "file-edit",
+        "project-terminal", "preview" -> {
             val state = when (screen) {
                 "chat-empty" -> workspaceState.copy(messages = emptyList())
+                "files-upload" -> workspaceState.copy(
+                    fileUpload = com.jarves.mh.model.FileUploadState(
+                        id = 1,
+                        directory = "app/build/output",
+                        fileName = "release-notes.txt",
+                        filesDone = 1,
+                        filesTotal = 3,
+                        bytesDone = 2_600_000,
+                        bytesTotal = 4_100_000,
+                    ),
+                )
+                "files-conflict" -> workspaceState.copy(
+                    uploadConflict = com.jarves.mh.model.UploadConflict("app/config", listOf("settings.json"), otherFiles = 2),
+                )
+                "file", "file-edit" -> {
+                    val source = "package com.example.weather\n\nclass WeatherWidget {\n    fun refresh() {\n        // TODO\n    }\n}\n"
+                    workspaceState.copy(
+                        openedFilePath = "app/src/main/java/com/example/weather/WeatherWidget.kt",
+                        openedFileContent = source,
+                        openedFileEditable = true,
+                        fileDraft = if (screen == "file-edit") {
+                            androidx.compose.foundation.text.input.TextFieldState(source.replace("// TODO", "updateViews()"))
+                        } else {
+                            null
+                        },
+                    )
+                }
+                "chat-attachments" -> workspaceState.copy(
+                    pendingAttachments = listOf(
+                        com.jarves.mh.model.ChatAttachment(
+                            displayName = "landing-page",
+                            relativePath = "uploads/landing-page",
+                            mimeType = com.jarves.mh.model.ChatAttachment.DIRECTORY_MIME_TYPE,
+                            sizeBytes = 48_213,
+                        ),
+                        com.jarves.mh.model.ChatAttachment(displayName = "mockup.png", relativePath = "attachments/c/mockup.png", mimeType = "image/png", sizeBytes = 312_000),
+                    ),
+                    archiveExtractionMessage = "Extracting assets.zip · 175 files",
+                )
                 "chat-live" -> workspaceState.copy(
                     messages = sampleMessages.take(1),
                     isRunning = true,
@@ -229,9 +269,11 @@ private fun UiGallery(screen: String) {
                 onAddAttachments = {},
                 onRemoveAttachment = {},
                 onOpenAttachment = {},
+                onExtractZip = { _, _, _ -> },
+                onImportZipProject = {},
                 onBuildAndRunAndroid = {},
                 initialTab = when (screen) {
-                    "files" -> WorkspaceTab.FILES
+                    "files", "files-upload", "files-conflict", "file", "file-edit" -> WorkspaceTab.FILES
                     "project-terminal" -> WorkspaceTab.TERMINAL
                     "preview" -> WorkspaceTab.PREVIEW
                     else -> WorkspaceTab.CHAT
