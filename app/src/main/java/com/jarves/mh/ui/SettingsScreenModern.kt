@@ -202,7 +202,7 @@ fun SettingsScreen(
         topBar = {
             LargeFlexibleTopAppBar(
                 title = { Text("Settings") },
-                subtitle = { Text("Mobile Harness ${BuildConfig.VERSION_NAME}") },
+                subtitle = { Text("PocketCode ${BuildConfig.VERSION_NAME}") },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.surface,
                     scrolledContainerColor = MaterialTheme.colorScheme.surfaceContainer,
@@ -338,7 +338,7 @@ fun SettingsScreen(
                 GroupedRow(
                     0,
                     2,
-                    "Mobile Harness",
+                    "PocketCode",
                     supporting = "Local AI coding workspace",
                     icon = Icons.Rounded.Info,
                     trailing = {
@@ -406,7 +406,7 @@ private fun ThemeChooser(mode: AppThemeMode, onSetThemeMode: (AppThemeMode) -> U
             }
             Spacer(Modifier.height(12.dp))
             Text(
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) "Colours follow your wallpaper." else "Colours use the Mobile Harness orange palette.",
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) "Colours follow your wallpaper." else "Colours use the PocketCode orange palette.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

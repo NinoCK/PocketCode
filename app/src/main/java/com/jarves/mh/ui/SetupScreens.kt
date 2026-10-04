@@ -269,7 +269,7 @@ private fun SetupTopBar(onBack: (() -> Unit)?, onToggleTheme: (() -> Unit)?) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 BrandMark(size = 32.dp)
                 Spacer(Modifier.width(10.dp))
-                Text("Mobile Harness", style = MaterialTheme.typography.titleMedium)
+                Text("PocketCode", style = MaterialTheme.typography.titleMedium)
             }
         },
         navigationIcon = {
@@ -491,7 +491,7 @@ internal fun StartupLoadingScreen(state: AppUiState, onToggleTheme: () -> Unit =
         Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
             BrandMark(size = 96.dp, spinning = true)
             Spacer(Modifier.height(28.dp))
-            Text("Mobile Harness", style = MaterialTheme.typography.headlineMedium)
+            Text("PocketCode", style = MaterialTheme.typography.headlineMedium)
             Spacer(Modifier.height(8.dp))
             AnimatedContent(
                 targetState = messages[messageIndex],
@@ -733,12 +733,12 @@ internal fun BackgroundTaskSetupScreen(
                         WelcomePage.BATTERY -> PermissionPageContent(
                             eyebrow = permissionEyebrow(WelcomePage.BATTERY),
                             title = "Background reliability",
-                            subtitle = "Let Mobile Harness keep working when you lock the phone or switch apps.",
+                            subtitle = "Let PocketCode keep working when you lock the phone or switch apps.",
                             heroIcon = Icons.Rounded.BatterySaver,
                             current = 1,
                             notificationGranted = notificationGranted,
                             batteryGranted = batteryGranted,
-                            hint = "Find Mobile Harness on the next screen and set it to “Not optimized” or “Unrestricted”, then come back."
+                            hint = "Find PocketCode on the next screen and set it to “Not optimized” or “Unrestricted”, then come back."
                                 .takeUnless { batteryGranted },
                             note = "While a task runs, only the processor stays awake, never the screen. It is released when the task ends, after 90 minutes at most, and needs no extra permission.",
                         )
@@ -753,7 +753,7 @@ internal fun BackgroundTaskSetupScreen(
 @Composable
 private fun WelcomePageContent() {
     SetupPageHeader(
-        title = "Welcome to Mobile Harness",
+        title = "Welcome to PocketCode",
         subtitle = "A complete coding workspace in your pocket. AI agents, a real Linux terminal and your projects, all running on this phone.",
         eyebrow = "Welcome",
         heroIcon = Icons.Rounded.Terminal,
@@ -764,7 +764,7 @@ private fun WelcomePageContent() {
     GroupedRow(2, 3, "Works in the background", supporting = "Lock your phone and get notified when a task finishes.", icon = Icons.Rounded.Notifications)
     Spacer(Modifier.height(16.dp))
     Text(
-        "Next, two quick settings keep your tasks running while Mobile Harness is off screen.",
+        "Next, two quick settings keep your tasks running while PocketCode is off screen.",
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
@@ -870,9 +870,9 @@ internal fun RuntimeSetupPromptScreen(
         SetupScaffold(
             title = if (compatible) "Ready to build on this phone" else "This phone isn't supported",
             subtitle = if (compatible) {
-                "Your phone meets the requirements. Choose your coding tools next and Mobile Harness handles the setup."
+                "Your phone meets the requirements. Choose your coding tools next and PocketCode handles the setup."
             } else {
-                "Mobile Harness needs a 64-bit ARM processor to run its Linux environment."
+                "PocketCode needs a 64-bit ARM processor to run its Linux environment."
             },
             eyebrow = "Device check",
             heroIcon = Icons.Rounded.PhoneAndroid,
@@ -922,7 +922,7 @@ internal fun RuntimeSetupPromptScreen(
                     textAlign = TextAlign.Center,
                 )
                 SetupPrimaryButton(
-                    text = if (compatible) "Install Mobile Harness" else "Device not supported",
+                    text = if (compatible) "Install PocketCode" else "Device not supported",
                     icon = Icons.Rounded.Download,
                     enabled = compatible,
                     onClick = onDownload,
@@ -1069,7 +1069,7 @@ internal fun RuntimeInstallationScreen(state: AppUiState, onToggleTheme: () -> U
     val progress = state.startupProgress.coerceIn(0f, 1f)
     SetupScaffold(
         title = "Building your workspace",
-        subtitle = "You can leave Mobile Harness in the background and follow setup from the notification.",
+        subtitle = "You can leave PocketCode in the background and follow setup from the notification.",
         eyebrow = "Installing",
         heroIcon = Icons.Rounded.Download,
         heroPolygon = MaterialShapes.SoftBurst,
@@ -1198,7 +1198,7 @@ internal fun AntigravityOnboardingScreen(
     val status = state.antigravityAuth.status
     SetupScaffold(
         title = "Connect your Google account",
-        subtitle = "Mobile Harness runs Google's official agy CLI in its private Linux environment. Google handles sign-in and agy keeps the session.",
+        subtitle = "PocketCode runs Google's official agy CLI in its private Linux environment. Google handles sign-in and agy keeps the session.",
         eyebrow = "Set up Antigravity",
         heroIcon = Icons.Rounded.Login,
         heroPolygon = MaterialShapes.Pill,
@@ -1261,7 +1261,7 @@ internal fun AntigravityOnboardingScreen(
                 Icon(Icons.Rounded.Warning, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onErrorContainer)
                 Spacer(Modifier.width(10.dp))
                 Text(
-                    "Automatic tool approval is on for Antigravity. It can edit project files and run commands without asking. Changes stay reviewable in Mobile Harness.",
+                    "Automatic tool approval is on for Antigravity. It can edit project files and run commands without asking. Changes stay reviewable in PocketCode.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onErrorContainer,
                 )
@@ -1384,7 +1384,7 @@ private fun DeviceCheckStep(onToggleTheme: (() -> Unit)?, onContinue: () -> Unit
     val arm64 = supportsArm64Runtime(Build.SUPPORTED_ABIS, System.getProperty("os.arch"))
     SetupScaffold(
         title = "Your phone is the workspace",
-        subtitle = "Mobile Harness checks compatibility before downloading its private Linux runtime.",
+        subtitle = "PocketCode checks compatibility before downloading its private Linux runtime.",
         heroIcon = Icons.Rounded.PhoneAndroid,
         heroPolygon = MaterialShapes.Sunny,
         step = 0,
@@ -1533,7 +1533,7 @@ private fun ProviderCredentialsStep(
         title = provider.title,
         subtitle = when {
             agentKind == AgentKind.DEEPSEEK_HARNESS -> "DeepSeek Harness connects through this API endpoint."
-            provider.protocol.name.startsWith("OPENAI") -> "Mobile Harness translates Claude Code requests for this provider."
+            provider.protocol.name.startsWith("OPENAI") -> "PocketCode translates Claude Code requests for this provider."
             else -> "Claude Code connects through this API endpoint."
         },
         eyebrow = "Step 3 of 3 · Encrypted locally",

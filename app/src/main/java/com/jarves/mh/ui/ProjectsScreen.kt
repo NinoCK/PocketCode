@@ -180,7 +180,7 @@ internal fun ProjectsScreen(
                     subtitle = {
                         Text(
                             when (projects.size) {
-                                0 -> "Mobile Harness"
+                                0 -> "PocketCode"
                                 1 -> "1 project"
                                 else -> "${projects.size} projects"
                             },
@@ -618,7 +618,7 @@ private fun UpdateBanner(versionName: String, onClick: () -> Unit, modifier: Mod
             Spacer(Modifier.width(14.dp))
             Column(Modifier.weight(1f)) {
                 Text("Update available", style = MaterialTheme.typography.titleMedium)
-                Text("Mobile Harness $versionName is ready to install", style = MaterialTheme.typography.bodyMedium)
+                Text("PocketCode $versionName is ready to install", style = MaterialTheme.typography.bodyMedium)
             }
             Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, null)
         }
@@ -822,7 +822,7 @@ private fun GitHubDialog(
                         )
                     }
                     Text(
-                        "Tap the code to copy it. Mobile Harness connects automatically after you approve.",
+                        "Tap the code to copy it. PocketCode connects automatically after you approve.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -920,7 +920,7 @@ private fun UpdateDialog(state: AppUiState, onDismiss: () -> Unit, onInstall: ()
         title = { Text("Update to ${update.versionName}") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text(update.notes.ifBlank { "Get the latest improvements and fixes for Mobile Harness." })
+                Text(update.notes.ifBlank { "Get the latest improvements and fixes for PocketCode." })
                 if (update.sizeBytes > 0) {
                     Text(
                         "Download size: ${formatMegabytes(update.sizeBytes)}",
@@ -934,7 +934,7 @@ private fun UpdateDialog(state: AppUiState, onDismiss: () -> Unit, onInstall: ()
                             Icon(Icons.Rounded.Warning, null, tint = MaterialTheme.colorScheme.onErrorContainer, modifier = Modifier.size(20.dp))
                             Spacer(Modifier.width(8.dp))
                             Text(
-                                "Allow ‘Install unknown apps’ for Mobile Harness. Without this permission, Android will not install the update.",
+                                "Allow ‘Install unknown apps’ for PocketCode. Without this permission, Android will not install the update.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onErrorContainer,
                             )

@@ -38,7 +38,7 @@ data class ClaudeAuthState(
  * prints its long-lived subscription token, which is handed to [onToken] for
  * Keystore-encrypted storage. The manual "paste the code" path of the same
  * official flow remains available when the localhost redirect cannot complete.
- * Mobile Harness never builds its own OAuth request.
+ * PocketCode never builds its own OAuth request.
  */
 class ClaudeAuthController(
     private val context: Context,
@@ -113,7 +113,7 @@ class ClaudeAuthController(
                         mutableState.value = mutableState.value.copy(
                             status = ClaudeAuthStatus.AWAITING_BROWSER,
                             authorizationUrl = url,
-                            message = "Sign in to Claude in your browser, then come back to Mobile Harness.",
+                            message = "Sign in to Claude in your browser, then come back to PocketCode.",
                         )
                     }
                 }
@@ -234,7 +234,7 @@ class ClaudeAuthController(
         helper.parentFile?.mkdirs()
         helper.writeText(
             """#!/bin/sh
-# Mobile Harness: receives Claude Code's sign-in URL instead of launching a
+# PocketCode: receives Claude Code's sign-in URL instead of launching a
 # desktop browser. The app opens it in the Android browser.
 url="${'$'}1"
 case "${'$'}url" in
@@ -273,7 +273,7 @@ exit 0
                 // The user is usually still in the browser; tell them it's done.
                 intent.setAction(RuntimeExecutionService.ACTION_COMPLETE)
                     .putExtra(RuntimeExecutionService.EXTRA_TITLE, "Claude subscription connected")
-                    .putExtra(RuntimeExecutionService.EXTRA_DETAIL, "Return to Mobile Harness to start coding.")
+                    .putExtra(RuntimeExecutionService.EXTRA_DETAIL, "Return to PocketCode to start coding.")
             } else {
                 intent.setAction(RuntimeExecutionService.ACTION_CANCELLED)
             }
