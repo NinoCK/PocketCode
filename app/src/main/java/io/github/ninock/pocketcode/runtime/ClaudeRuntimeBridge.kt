@@ -218,7 +218,7 @@ class ClaudeRuntimeBridge(
         messageUsage.clear()
         eventBus.emit(RuntimeEvent.SessionStarted(sessionId))
         pushForegroundProgress("Starting Claude Code…")
-        val secret = secretFor(provider).orEmpty()
+        val secret = secretFor(provider).orEmpty().ifBlank { localServerPlaceholderKey(provider) }
         if (secret.isBlank()) {
             val message = if (provider.kind == ProviderKind.CLAUDE) {
                 "No Claude subscription token is saved. Add one from Agent → AI provider."

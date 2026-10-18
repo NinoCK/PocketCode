@@ -43,6 +43,9 @@ data class AgentUpdateInfo(
     val latestVersion: String,
 )
 
+internal fun isSupportedDshVersion(version: String): Boolean =
+    version == RuntimeInstaller.DSH_VERSION
+
 enum class RuntimeInstallEvent { STAGE, COMMAND, OUTPUT, DOWNLOAD, COMMAND_COMPLETED, COMPLETED }
 
 private data class RuntimeBundle(
@@ -150,7 +153,19 @@ class RuntimeInstaller(private val context: Context) {
         val proot = File(context.applicationInfo.nativeLibraryDir, "libproot.so")
         require(proot.canExecute()) { "The embedded PRoot launcher is unavailable" }
 
-        if (!File(rootfs, "usr/bin/bash").exists() || rootfsMarker.readTextOrNull() != ROOTFS_VERSION) {
+        val staging = File(runtimeDir, "ubuntu.installing")
+        val repairBackup = File(runtimeDir, "ubuntu.repair-backup")
+        RootfsRepair.reconcileInterruptedSwap(
+            rootfs = rootfs,
+            staging = staging,
+            backup = repairBackup,
+            validate = ::isValidCoreRootfs,
+        )
+        val layoutBroken = rootfs.isDirectory && !ensureRootfsCompatibilityLinks()
+        if (layoutBroken ||
+            !File(rootfs, "usr/bin/bash").exists() ||
+            rootfsMarker.readTextOrNull() != ROOTFS_VERSION
+        ) {
             onProgress(RuntimeInstallProgress("Preparing the private development runtime", 0.03f))
             val archive = obtainRuntimeBundle(
                 CORE_BUNDLE,
@@ -160,15 +175,16 @@ class RuntimeInstaller(private val context: Context) {
                 onProgress,
             )
             onProgress(RuntimeInstallProgress("Verifying and unpacking the Core runtime", 0.28f))
-            val staging = File(runtimeDir, "ubuntu.installing")
             staging.deleteRecursively()
             staging.mkdirs()
             extractZstdTar(archive, staging)
             stripMacosMetadataArtifacts(staging)
-            require(File(staging, "usr/bin/bash").isFile) { "Core bundle is missing Bash" }
-            rootfs.deleteRecursively()
-            check(staging.renameTo(rootfs)) { "Could not activate the Linux environment" }
-            check(ensureRootfsCompatibilityLinks()) { "Core runtime has an invalid Linux filesystem layout" }
+            RootfsRepair.activate(
+                rootfs = rootfs,
+                staging = staging,
+                backup = repairBackup,
+                validate = ::isValidCoreRootfs,
+            )
             writeResolver()
             if (archive.parentFile == downloads) archive.delete()
         }
@@ -246,7 +262,7 @@ class RuntimeInstaller(private val context: Context) {
                 // /usr/local/bin/dsh is an absolute guest symlink. File.exists() follows it
                 // against Android's host root and therefore reports false outside PRoot.
                 File(rootfs, "usr/local/lib/dsh/node_modules/.bin/dsh").isFile &&
-                !dshMarker.readTextOrNull().isNullOrBlank()
+                isSupportedDshVersion(dshMarker.readTextOrNull().orEmpty())
             io.github.ninock.pocketcode.model.AgentKind.ANTIGRAVITY -> isInstalled() &&
                 File(rootfs, AGY_GUEST_PATH.removePrefix("/")).canExecute() &&
                 !agyMarker.readTextOrNull().isNullOrBlank()
@@ -330,7 +346,7 @@ class RuntimeInstaller(private val context: Context) {
 
         dshMarker.readTextOrNull()
             ?.trim()
-            ?.takeIf { it.isNotEmpty() && File(rootfs, "usr/local/lib/dsh/node_modules/.bin/dsh").isFile }
+            ?.takeIf { isAgentInstalled(io.github.ninock.pocketcode.model.AgentKind.DEEPSEEK_HARNESS) }
             ?.let { put(io.github.ninock.pocketcode.model.AgentKind.DEEPSEEK_HARNESS, it) }
 
         agyMarker.readTextOrNull()
@@ -351,10 +367,11 @@ class RuntimeInstaller(private val context: Context) {
                 }
             }
             installed[io.github.ninock.pocketcode.model.AgentKind.DEEPSEEK_HARNESS]?.let { current ->
-                runCatching {
-                    JSONObject(fetchText("https://registry.npmjs.org/@deepseek-ai/dsh/latest")).getString("version")
-                }.getOrNull()?.takeIf { isVersionNewer(it, current) }?.let { latest ->
-                    put(io.github.ninock.pocketcode.model.AgentKind.DEEPSEEK_HARNESS, AgentUpdateInfo(current, latest))
+                // DSH needs Android-specific filesystem patches. Only advertise the
+                // release validated and bundled with this PocketDev build; npm's
+                // latest tag may point at a source layout we cannot safely patch.
+                DSH_VERSION.takeIf { isVersionNewer(it, current) }?.let { compatible ->
+                    put(io.github.ninock.pocketcode.model.AgentKind.DEEPSEEK_HARNESS, AgentUpdateInfo(current, compatible))
                 }
             }
             installed[io.github.ninock.pocketcode.model.AgentKind.ANTIGRAVITY]?.let { current ->
@@ -446,29 +463,57 @@ class RuntimeInstaller(private val context: Context) {
         expectedVersion: String,
         onProgress: suspend (RuntimeInstallProgress) -> Unit,
     ) {
-        val latest = JSONObject(fetchText("https://registry.npmjs.org/@deepseek-ai/dsh/latest")).getString("version")
-        check(latest == expectedVersion) { "A newer DeepSeek Harness release appeared. Check again before updating." }
-        val quotedVersion = latest.replace(Regex("[^0-9A-Za-z.+-]"), "")
-        check(quotedVersion == latest) { "Invalid DeepSeek Harness version" }
+        check(isSupportedDshVersion(expectedVersion)) {
+            "DeepSeek Harness $expectedVersion is not compatible with this PocketCode build"
+        }
+        val quotedVersion = expectedVersion.replace(Regex("[^0-9A-Za-z.+-]"), "")
+        check(quotedVersion == expectedVersion) { "Invalid DeepSeek Harness version" }
         runGuestCommand(
             proot = runtime.proot,
-            command = "set -e; next=/usr/local/lib/dsh.updating; old=/usr/local/lib/dsh.previous; " +
-                "rm -rf \"${'$'}next\" \"${'$'}old\"; mkdir -p \"${'$'}next\"; " +
+            command = "set -e; next=/usr/local/lib/dsh.updating; " +
+                "rm -rf \"${'$'}next\"; mkdir -p \"${'$'}next\"; " +
                 "cd \"${'$'}next\"; npm init -y >/dev/null; " +
-                "npm install --omit=dev --no-audit --no-fund @deepseek-ai/dsh@$quotedVersion; " +
-                "mv /usr/local/lib/dsh \"${'$'}old\"; " +
-                "if mv \"${'$'}next\" /usr/local/lib/dsh; then rm -rf \"${'$'}old\"; " +
-                "else mv \"${'$'}old\" /usr/local/lib/dsh; exit 1; fi",
+                "npm install --omit=dev --no-audit --no-fund @deepseek-ai/dsh@$quotedVersion",
             displayCommand = "npm install @deepseek-ai/dsh@$quotedVersion",
             fraction = 0.55f,
             timeoutMs = 20 * 60 * 1_000L,
             onProgress = onProgress,
             failureMessage = "DeepSeek Harness update failed; the installed version was preserved",
         )
-        dshMarker.writeText(latest)
-        dshAndroidCompatibilityMarker.delete()
-        ensureDshAndroidCompatibility()
-        verifyGuest(runtime.proot, "/usr/local/bin/dsh --profile headless --help", "DeepSeek Harness update verification failed")
+        val staged = File(rootfs, "usr/local/lib/dsh.updating")
+        applyDshAndroidCompatibility(staged, expectedVersion)
+        runGuestCommand(
+            proot = runtime.proot,
+            command = "set -e; old=/usr/local/lib/dsh.previous; rm -rf \"${'$'}old\"; " +
+                "mv /usr/local/lib/dsh \"${'$'}old\"; " +
+                "if mv /usr/local/lib/dsh.updating /usr/local/lib/dsh; then :; " +
+                "else mv \"${'$'}old\" /usr/local/lib/dsh; exit 1; fi",
+            displayCommand = "Activate DeepSeek Harness $quotedVersion",
+            fraction = 0.9f,
+            timeoutMs = 60_000L,
+            onProgress = onProgress,
+            failureMessage = "DeepSeek Harness update failed; the installed version was preserved",
+        )
+        val verified = runCatching {
+            verifyGuest(runtime.proot, "/usr/local/bin/dsh --profile headless --help", "DeepSeek Harness update verification failed")
+        }
+        if (verified.isFailure) {
+            runCatching {
+                runGuestCommand(
+                    proot = runtime.proot,
+                    command = "set -e; rm -rf /usr/local/lib/dsh; mv /usr/local/lib/dsh.previous /usr/local/lib/dsh",
+                    displayCommand = "Restore previous DeepSeek Harness",
+                    fraction = 0.95f,
+                    timeoutMs = 60_000L,
+                    onProgress = onProgress,
+                    failureMessage = "DeepSeek Harness update failed; the installed version was preserved",
+                )
+            }
+            verified.getOrThrow()
+        }
+        File(rootfs, "usr/local/lib/dsh.previous").deleteRecursively()
+        dshMarker.writeText(expectedVersion)
+        dshAndroidCompatibilityMarker.writeText(DSH_ANDROID_COMPATIBILITY_VERSION)
     }
 
     private fun fetchAgyManifest(): JSONObject = JSONObject(
@@ -557,6 +602,14 @@ class RuntimeInstaller(private val context: Context) {
             ensureDshAndroidCompatibility()
             return
         }
+        // Remove partial or unsupported npm updates before restoring the bundled,
+        // Android-validated release. The user can recover simply by launching DSH
+        // again; project files and conversations live outside this overlay.
+        File(rootfs, "usr/local/lib/dsh").deleteRecursively()
+        File(rootfs, "usr/local/lib/dsh.updating").deleteRecursively()
+        File(rootfs, "usr/local/lib/dsh.previous").deleteRecursively()
+        dshMarker.delete()
+        dshAndroidCompatibilityMarker.delete()
         installRuntimeOverlay(
             bundle = DSH_BUNDLE,
             message = "Installing DeepSeek Harness $DSH_VERSION",
@@ -582,13 +635,21 @@ class RuntimeInstaller(private val context: Context) {
      */
     fun ensureDshAndroidCompatibility() {
         if (!isAgentInstalled(io.github.ninock.pocketcode.model.AgentKind.DEEPSEEK_HARNESS)) return
+        applyDshAndroidCompatibility(File(rootfs, "usr/local/lib/dsh"), dshMarker.readTextOrNull().orEmpty())
+        dshAndroidCompatibilityMarker.writeText(DSH_ANDROID_COMPATIBILITY_VERSION)
+    }
+
+    private fun applyDshAndroidCompatibility(dshRoot: File, version: String) {
+        check(isSupportedDshVersion(version)) {
+            "DeepSeek Harness $version is not compatible with this PocketCode build"
+        }
         val persistence = File(
-            rootfs,
-            "usr/local/lib/dsh/node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+            dshRoot,
+            "node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
         )
         val localFs = File(
-            rootfs,
-            "usr/local/lib/dsh/node_modules/@deepseek-ai/dsh-fs-local/lib/index.js",
+            dshRoot,
+            "node_modules/@deepseek-ai/dsh-fs-local/lib/index.js",
         )
         patchDshHardLinkPublication(
             file = persistence,
@@ -604,7 +665,6 @@ class RuntimeInstaller(private val context: Context) {
             callBefore = "await linkFile(tempPath, absolutePath);",
             callAfter = "await copyFile(tempPath, absolutePath, 1);",
         )
-        dshAndroidCompatibilityMarker.writeText(DSH_ANDROID_COMPATIBILITY_VERSION)
     }
 
     private fun patchDshHardLinkPublication(
@@ -618,7 +678,7 @@ class RuntimeInstaller(private val context: Context) {
         var source = file.readText()
         if (callAfter in source && importAfter in source) return
         check(callBefore in source && importBefore in source) {
-            "DeepSeek Harness $DSH_VERSION is not compatible with this PocketCode build"
+            "Installed DeepSeek Harness source is not compatible with this PocketCode build"
         }
         source = source.replace(importBefore, importAfter).replace(callBefore, callAfter)
         file.writeText(source)
@@ -723,8 +783,7 @@ class RuntimeInstaller(private val context: Context) {
     private fun removeAndroidGradleProperty() {
         val properties = File(rootfs, "root/.gradle/gradle.properties")
         if (!properties.isFile) return
-        val propertyPattern = Regex("^\\s*${Regex.escape(ANDROID_AAPT2_PROPERTY)}\\s*[:=].*$")
-        val remaining = properties.readLines().filterNot { propertyPattern.matches(it) }
+        val remaining = properties.readLines().filterNot(::isManagedAndroidGradleProperty)
         if (remaining.isEmpty()) {
             properties.delete()
         } else {
@@ -1061,16 +1120,26 @@ class RuntimeInstaller(private val context: Context) {
         writeAndroidGradleInitScript(runtimeRootfs)
         val gradleDir = File(runtimeRootfs, "root/.gradle").apply { mkdirs() }
         val properties = File(gradleDir, "gradle.properties")
-        val propertyPattern = Regex("^\\s*${Regex.escape(ANDROID_AAPT2_PROPERTY)}\\s*[:=].*$")
         val existingLines = properties.readTextOrNull()?.lineSequence()?.toList().orEmpty()
-        val expectedLine = "$ANDROID_AAPT2_PROPERTY=$ANDROID_AAPT2_GUEST_PATH"
-        val updatedLines = existingLines.filterNot { propertyPattern.matches(it) } + expectedLine
+        val managedLines = listOf(
+            "$ANDROID_AAPT2_PROPERTY=$ANDROID_AAPT2_GUEST_PATH",
+            "$GRADLE_JVMARGS_PROPERTY=-Xmx512m -XX:MaxMetaspaceSize=256m -Dfile.encoding=UTF-8",
+            "$GRADLE_WORKERS_PROPERTY=2",
+            "$GRADLE_PARALLEL_PROPERTY=false",
+            "$KOTLIN_EXECUTION_PROPERTY=in-process",
+        )
+        val updatedLines = existingLines.filterNot(::isManagedAndroidGradleProperty) + managedLines
         if (existingLines == updatedLines) return
 
         val temporary = File(gradleDir, "gradle.properties.pocketdev.tmp")
         temporary.writeText(updatedLines.joinToString("\n").trimEnd() + "\n")
         Os.rename(temporary.absolutePath, properties.absolutePath)
     }
+
+    private fun isManagedAndroidGradleProperty(line: String): Boolean =
+        MANAGED_ANDROID_GRADLE_PROPERTIES.any { key ->
+            Regex("^\\s*${Regex.escape(key)}\\s*[:=].*$").matches(line)
+        }
 
     /**
      * One-time upgrade path from the old single-bundle layout: devices that already
@@ -1371,8 +1440,8 @@ class RuntimeInstaller(private val context: Context) {
      * making every ELF executable misleadingly fail with ENOENT. Restore only
      * the known Ubuntu compatibility links and never replace real directories.
      */
-    private fun ensureRootfsCompatibilityLinks(): Boolean {
-        if (!rootfs.isDirectory) return false
+    private fun ensureRootfsCompatibilityLinks(targetRootfs: File = rootfs): Boolean {
+        if (!targetRootfs.isDirectory) return false
         val links = mapOf(
             "bin" to "usr/bin",
             "lib" to "usr/lib",
@@ -1380,7 +1449,7 @@ class RuntimeInstaller(private val context: Context) {
         )
         return runCatching {
             links.forEach { (name, destination) ->
-                val link = File(rootfs, name)
+                val link = File(targetRootfs, name)
                 val path = link.toPath()
                 if (java.nio.file.Files.isSymbolicLink(path)) {
                     if (java.nio.file.Files.readSymbolicLink(path).toString() != destination) {
@@ -1393,13 +1462,18 @@ class RuntimeInstaller(private val context: Context) {
                     Os.symlink(destination, link.absolutePath)
                 }
             }
-            File(rootfs, "usr/bin/env").canExecute() &&
-                File(rootfs, "usr/bin/bash").canExecute() &&
-                File(rootfs, "lib/ld-linux-aarch64.so.1").exists()
+            File(targetRootfs, "usr/bin/env").canExecute() &&
+                File(targetRootfs, "usr/bin/bash").canExecute() &&
+                File(targetRootfs, "lib/ld-linux-aarch64.so.1").exists()
         }.onFailure {
             android.util.Log.e("RuntimeInstaller", "Could not repair Linux compatibility links", it)
         }.getOrDefault(false)
     }
+
+    private fun isValidCoreRootfs(targetRootfs: File): Boolean =
+        ensureRootfsCompatibilityLinks(targetRootfs) &&
+            File(targetRootfs, "usr/bin/bash").isFile &&
+            File(targetRootfs, ".pocket-rootfs-version").readTextOrNull() == ROOTFS_VERSION
 
     private fun actionableProcessError(output: String, fallback: String): String {
         val lines = output.lineSequence().map(String::trim).filter(String::isNotBlank).toList()
@@ -1843,6 +1917,17 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decis
         private const val ANDROID_MAVEN_URL = "$ANDROID_ASSET_BASE/localMvnRepository.zip"
         private const val ANDROID_MAVEN_SHA256 = "3ba89892b43377d60743568d1b9004f172c2eab75dac059064f82dec497819f9"
         private const val ANDROID_AAPT2_PROPERTY = "android.aapt2FromMavenOverride"
+        private const val GRADLE_JVMARGS_PROPERTY = "org.gradle.jvmargs"
+        private const val GRADLE_WORKERS_PROPERTY = "org.gradle.workers.max"
+        private const val GRADLE_PARALLEL_PROPERTY = "org.gradle.parallel"
+        private const val KOTLIN_EXECUTION_PROPERTY = "kotlin.compiler.execution.strategy"
+        private val MANAGED_ANDROID_GRADLE_PROPERTIES = setOf(
+            ANDROID_AAPT2_PROPERTY,
+            GRADLE_JVMARGS_PROPERTY,
+            GRADLE_WORKERS_PROPERTY,
+            GRADLE_PARALLEL_PROPERTY,
+            KOTLIN_EXECUTION_PROPERTY,
+        )
         private const val ANDROID_AAPT2_GUEST_PATH = "/root/android-sdk/build-tools/35.0.0/aapt2"
         private const val ANDROID_AAPT2_HOST_PATH = "root/android-sdk/build-tools/35.0.0/aapt2"
         private val CLAUDE_VERSION_PATTERN = Regex("[0-9]+\\.[0-9]+\\.[0-9]+")

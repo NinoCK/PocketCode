@@ -278,7 +278,8 @@ internal fun AgentSettingsSection(
     fun discoverModels() {
         val effectiveKey = apiKey.trim().ifBlank { newApiKey.trim() }
         val supportsPublicDiscovery = selectedKind == ProviderKind.LLM_ROUTER ||
-            selectedKind == ProviderKind.OPENCODE_ZEN
+            selectedKind == ProviderKind.OPENCODE_ZEN ||
+            selectedKind == ProviderKind.CUSTOM // self-hosted servers often need no key
         if (effectiveKey.isBlank() && !supportsPublicDiscovery) {
             status = "Please enter or save an API key first to discover models."
             statusOk = false
@@ -1824,7 +1825,7 @@ private fun AgentProviderCard(
             Spacer(Modifier.height(12.dp))
             OutlinedButton(
                 onClick = onValidate,
-                enabled = apiKey.isNotBlank() && !isDiscovering && !isValidating &&
+                enabled = (apiKey.isNotBlank() || selectedKind == ProviderKind.CUSTOM) && !isDiscovering && !isValidating &&
                     (selectedKind == ProviderKind.CLAUDE || (baseUrl.isNotBlank() && model.isNotBlank())),
                 modifier = Modifier.fillMaxWidth().height(46.dp),
             ) {

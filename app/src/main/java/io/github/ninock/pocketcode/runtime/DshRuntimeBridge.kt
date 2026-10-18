@@ -69,7 +69,7 @@ class DshRuntimeBridge(
         lastThinkingUpdateAt = 0L
         eventBus.emit(RuntimeEvent.SessionStarted(sessionId))
         pushForegroundProgress("Starting DeepSeek Harness…")
-        val secret = secretFor(provider).orEmpty()
+        val secret = secretFor(provider).orEmpty().ifBlank { localServerPlaceholderKey(provider) }
         if (secret.isBlank()) {
             eventBus.emit(RuntimeEvent.SessionFailed(sessionId, "No API key is saved for ${provider.kind.title}."))
             return@withContext sessionId
@@ -162,7 +162,10 @@ class DshRuntimeBridge(
             } else if (!File(checkpoints.checkpointDir(projectId), "changes.json").isFile) {
                 acceptLastChanges(projectId)
             }
-            if (exit == 0 && sdkResult.completed && !userStopRequested) {
+            // `turn/end` is the authoritative result. Some Android/PRoot builds keep
+            // the SDK wrapper alive after acknowledging shutdown, so cleanup may end
+            // it with SIGKILL and produce 137 even though the turn completed normally.
+            if (sdkResult.completed && sdkResult.failure.isBlank() && !userStopRequested) {
                 emitCompletedOnce(sessionId)
                 finishForegroundRuntime(
                     completed = true,
@@ -214,7 +217,9 @@ class DshRuntimeBridge(
         var sawActivity = false
         var shutdownSent = false
         var shutdownSentAt = 0L
+        var forcedShutdown = false
         var inputClosed = false
+        var discardingOversizedLine = false
         var failure = ""
 
         fun send(method: String, id: Int, params: JSONObject? = null) {
@@ -310,11 +315,14 @@ class DshRuntimeBridge(
         while (process.isAlive || nativeProcess.outputFile.length() > outputOffset) {
             if (
                 process.isAlive &&
+                !forcedShutdown &&
                 shutdownSentAt > 0L &&
                 android.os.SystemClock.elapsedRealtime() - shutdownSentAt >= SDK_SHUTDOWN_TIMEOUT_MS
             ) {
                 closeInput()
-                process.destroy()
+                forcedShutdown = true
+                Log.w("DshBridge", "SDK acknowledged completion but did not exit; stopping its runtime wrapper")
+                process.destroyForcibly()
             }
             val available = nativeProcess.outputFile.length() - outputOffset
             if (available <= 0) {
@@ -328,17 +336,34 @@ class DshRuntimeBridge(
             }
             if (count <= 0) continue
             outputOffset += count
-            pendingOutput.append(bytes.decodeToString(0, count))
+            var decoded = bytes.decodeToString(0, count)
+            if (discardingOversizedLine) {
+                val end = decoded.indexOf('\n')
+                if (end < 0) continue
+                decoded = decoded.substring(end + 1)
+                discardingOversizedLine = false
+            }
+            pendingOutput.append(decoded)
             var newline = pendingOutput.indexOf("\n")
             while (newline >= 0) {
                 val line = pendingOutput.substring(0, newline).trimEnd('\r')
                 pendingOutput.delete(0, newline + 1)
-                if (line.isNotBlank()) handle(parser.parseLine(line))
+                if (line.isNotBlank() && !parser.consumeDuplicateAssistantMessage(line)) {
+                    handle(parser.parseLine(line))
+                }
                 newline = pendingOutput.indexOf("\n")
+            }
+            if (pendingOutput.length > MAX_DSH_PROTOCOL_LINE_CHARS) {
+                val duplicate = parser.consumeDuplicateAssistantMessage(pendingOutput)
+                pendingOutput.clear()
+                discardingOversizedLine = true
+                if (!duplicate) {
+                    handle(DshSdkProtocolEvent.Failed("DeepSeek Harness sent an oversized response"))
+                }
             }
         }
         pendingOutput.toString().trim().takeIf(String::isNotBlank)?.let {
-            handle(parser.parseLine(it))
+            if (!parser.consumeDuplicateAssistantMessage(it)) handle(parser.parseLine(it))
         }
         closeInput()
         return DshSdkRunResult(completed = completed, failure = failure)
@@ -461,22 +486,23 @@ class DshRuntimeBridge(
         isFinal: Boolean,
         force: Boolean = false,
     ) {
-        val summary = text.replace(Regex("\\s+"), " ").trim().take(2_000)
-        if (summary.isBlank()) return
         val now = android.os.SystemClock.elapsedRealtime()
-        if (force || now - lastThinkingUpdateAt >= 400) {
-            lastThinkingUpdateAt = now
-            eventBus.emit(
-                RuntimeEvent.ReasoningSummary(
-                    sessionId = sessionId,
-                    summary = summary,
-                    blockId = blockId,
-                    startsNewBlock = startsNewBlock,
-                    isFinal = isFinal,
-                ),
-            )
-            pushForegroundProgress("Thinking…")
-        }
+        // Reasoning arrives as a cumulative value. Skip throttled frames before doing
+        // any text work so a long-running agent cannot repeatedly scan a multi-MB string.
+        if (!force && now - lastThinkingUpdateAt < 400) return
+        val summary = compactDshText(text, MAX_DSH_REASONING_BUFFER, MAX_DSH_REASONING_SUMMARY)
+        if (summary.isBlank()) return
+        lastThinkingUpdateAt = now
+        eventBus.emit(
+            RuntimeEvent.ReasoningSummary(
+                sessionId = sessionId,
+                summary = summary,
+                blockId = blockId,
+                startsNewBlock = startsNewBlock,
+                isFinal = isFinal,
+            ),
+        )
+        pushForegroundProgress("Thinking…")
     }
 
     private suspend fun emitCompletedOnce(sessionId: String) {
@@ -779,8 +805,18 @@ private fun String.isMeaningfulDshText(): Boolean =
 internal class DshSdkProtocolParser(private val expectedSessionId: String) {
     private val reasoningByBlock = mutableMapOf<Long, StringBuilder>()
     private val textByBlock = mutableMapOf<Long, StringBuilder>()
-    private val streamedTextSinceMessage = StringBuilder()
+    private var streamedTextSinceMessage = false
     private val toolNames = mutableMapOf<String, String>()
+
+    /** The SDK repeats the entire final assistant message after streaming its deltas.
+     * Recognize that frame before JSONObject allocates another full object graph. */
+    fun consumeDuplicateAssistantMessage(line: CharSequence): Boolean {
+        if (!streamedTextSinceMessage) return false
+        if (!line.contains("\"method\":\"session.event\"") ||
+            !line.contains("\"type\":\"assistant/message\"")) return false
+        streamedTextSinceMessage = false
+        return true
+    }
 
     fun parseLine(line: String): DshSdkProtocolEvent {
         val frame = runCatching { JSONObject(line) }.getOrNull()
@@ -831,10 +867,10 @@ internal class DshSdkProtocolParser(private val expectedSessionId: String) {
                 val text = contentText(content)
                 if (text.isBlank()) {
                     DshSdkProtocolEvent.Ignored
-                } else if (streamedTextSinceMessage.isNotEmpty()) {
+                } else if (streamedTextSinceMessage) {
                     // `assistant/message` repeats the completed content after the SDK has
                     // already delivered its text deltas. The UI has appended those deltas.
-                    streamedTextSinceMessage.clear()
+                    streamedTextSinceMessage = false
                     DshSdkProtocolEvent.Ignored
                 } else {
                     DshSdkProtocolEvent.AssistantText(text)
@@ -857,9 +893,7 @@ internal class DshSdkProtocolParser(private val expectedSessionId: String) {
                 val text = contentText(resultBlock?.optJSONArray("content"))
                 val summary = error?.optString("message").orEmpty()
                     .meaningfulDshText(text)
-                    .replace(Regex("\\s+"), " ")
-                    .trim()
-                    .take(180)
+                    .let { compactDshText(it, MAX_DSH_TOOL_RAW_TEXT, 180) }
                     .ifBlank { "$name completed" }
                 DshSdkProtocolEvent.ToolCompleted(callId, name, summary)
             }
@@ -889,8 +923,9 @@ internal class DshSdkProtocolParser(private val expectedSessionId: String) {
             "text-delta" -> {
                 val delta = chunk.optString("text")
                 if (delta.isEmpty()) return DshSdkProtocolEvent.Ignored
-                textByBlock.getOrPut(blockId) { StringBuilder() }.append(delta)
-                streamedTextSinceMessage.append(delta)
+                textByBlock.getOrPut(blockId) { StringBuilder() }
+                    .appendBounded(delta, MAX_DSH_TEXT_BLOCK_BUFFER)
+                streamedTextSinceMessage = true
                 DshSdkProtocolEvent.AssistantText(delta)
             }
             "reasoning-delta" -> {
@@ -898,7 +933,7 @@ internal class DshSdkProtocolParser(private val expectedSessionId: String) {
                 // A block starts at its first visible text. Whitespace-only leading deltas are
                 // dropped downstream, so marking them as the start would orphan the whole block.
                 val starts = buffer.isBlank()
-                buffer.append(chunk.optString("text"))
+                buffer.appendBounded(chunk.optString("text"), MAX_DSH_REASONING_BUFFER)
                 if (buffer.isBlank()) DshSdkProtocolEvent.Ignored
                 else DshSdkProtocolEvent.Reasoning(blockId, buffer.toString(), starts, isFinal = false)
             }
@@ -907,13 +942,17 @@ internal class DshSdkProtocolParser(private val expectedSessionId: String) {
                 if (block?.optString("type") == "text") {
                     val streamed = textByBlock.remove(blockId)?.toString().orEmpty()
                     val complete = block.optString("text")
-                    val missingSuffix = complete.takeIf { it.startsWith(streamed) }?.removePrefix(streamed).orEmpty()
+                    // Text deltas are already delivered directly. The completed block normally
+                    // repeats them, so avoid retaining or comparing the full response.
+                    val missingSuffix = if (streamed.isEmpty()) complete.takeLast(MAX_DSH_TEXT_BLOCK_BUFFER) else ""
                     if (missingSuffix.isBlank()) return DshSdkProtocolEvent.Ignored
-                    streamedTextSinceMessage.append(missingSuffix)
+                    streamedTextSinceMessage = true
                     return DshSdkProtocolEvent.AssistantText(missingSuffix)
                 }
                 if (block?.optString("type") != "reasoning") return DshSdkProtocolEvent.Ignored
-                val text = block.optString("text").ifBlank { reasoningByBlock[blockId]?.toString().orEmpty() }
+                val text = block.optString("text")
+                    .ifBlank { reasoningByBlock[blockId]?.toString().orEmpty() }
+                    .takeLast(MAX_DSH_REASONING_BUFFER)
                 val starts = reasoningByBlock.remove(blockId).isNullOrBlank()
                 if (text.isBlank()) DshSdkProtocolEvent.Ignored
                 else DshSdkProtocolEvent.Reasoning(blockId, text, starts, isFinal = true)
@@ -945,20 +984,61 @@ internal class DshSdkProtocolParser(private val expectedSessionId: String) {
             listOf("path", "file_path", "command", "pattern", "query")
                 .firstNotNullOfOrNull { key -> json.optString(key).takeIf(String::isNotBlank) }
         }.orEmpty()
-        return detail.ifBlank { arguments }.replace(Regex("\\s+"), " ").trim().take(240)
+        return compactDshText(detail.ifBlank { arguments }, MAX_DSH_TOOL_RAW_TEXT, 240)
             .ifBlank { "Working in the project" }
     }
 
     private fun contentText(content: JSONArray?): String {
         if (content == null) return ""
-        return buildList {
-            for (index in 0 until content.length()) {
-                val block = content.optJSONObject(index) ?: continue
-                when (block.optString("type")) {
-                    "text" -> block.optString("text").takeIf(String::isNotBlank)?.let(::add)
-                    "tool-result" -> contentText(block.optJSONArray("content")).takeIf(String::isNotBlank)?.let(::add)
-                }
+        val result = StringBuilder()
+        for (index in 0 until content.length()) {
+            val block = content.optJSONObject(index) ?: continue
+            val text = when (block.optString("type")) {
+                "text" -> block.optString("text")
+                "tool-result" -> contentText(block.optJSONArray("content"))
+                else -> ""
             }
-        }.joinToString("\n")
+            if (text.isBlank()) continue
+            if (result.isNotEmpty()) result.append('\n')
+            result.appendBounded(text, MAX_DSH_CONTENT_TEXT)
+        }
+        return result.toString()
     }
+}
+
+private const val MAX_DSH_REASONING_BUFFER = 8_000
+private const val MAX_DSH_REASONING_SUMMARY = 2_000
+private const val MAX_DSH_TOOL_RAW_TEXT = 4_000
+private const val MAX_DSH_TEXT_BLOCK_BUFFER = 8_000
+private const val MAX_DSH_CONTENT_TEXT = 16_000
+private const val MAX_DSH_PROTOCOL_LINE_CHARS = 256 * 1024
+
+private fun StringBuilder.appendBounded(value: String, maxChars: Int) {
+    if (value.length >= maxChars) {
+        clear()
+        append(value.takeLast(maxChars))
+        return
+    }
+    append(value)
+    val overflow = length - maxChars
+    if (overflow > 0) delete(0, overflow)
+}
+
+/** Collapses whitespace while inspecting only a bounded tail of untrusted agent output. */
+internal fun compactDshText(value: String, rawLimit: Int, outputLimit: Int): String {
+    if (value.isEmpty() || rawLimit <= 0 || outputLimit <= 0) return ""
+    val start = (value.length - rawLimit).coerceAtLeast(0)
+    val result = StringBuilder(value.length - start)
+    var pendingSpace = false
+    for (index in start until value.length) {
+        val char = value[index]
+        if (char.isWhitespace()) {
+            pendingSpace = result.isNotEmpty()
+        } else {
+            if (pendingSpace) result.append(' ')
+            pendingSpace = false
+            result.append(char)
+        }
+    }
+    return result.toString().takeLast(outputLimit)
 }

@@ -258,6 +258,12 @@ internal fun WorkspaceScreen(
     val keyboardVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
     val fileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments(), onAddAttachments)
     val photoLauncher = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(MaxChatAttachments), onAddAttachments)
+    var pendingCameraPhoto by rememberSaveable { mutableStateOf<String?>(null) }
+    val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { saved ->
+        val uri = pendingCameraPhoto?.let(Uri::parse)
+        pendingCameraPhoto = null
+        if (saved && uri != null) onAddAttachments(listOf(uri))
+    }
     var pendingZip by rememberSaveable { mutableStateOf<Uri?>(null) }
     val zipLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) pendingZip = uri }
     var showAttachSheet by rememberSaveable { mutableStateOf(false) }
@@ -334,6 +340,17 @@ internal fun WorkspaceScreen(
             onPhotos = {
                 showAttachSheet = false
                 photoLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            },
+            onCamera = {
+                showAttachSheet = false
+                runCatching {
+                    val uri = createCameraPhotoUri(context)
+                    pendingCameraPhoto = uri.toString()
+                    cameraLauncher.launch(uri)
+                }.onFailure {
+                    pendingCameraPhoto = null
+                    Toast.makeText(context, "No camera app is available", Toast.LENGTH_LONG).show()
+                }
             },
             onFiles = {
                 showAttachSheet = false
@@ -1389,8 +1406,11 @@ private fun WorkBlock(
                     if (items.isEmpty()) {
                         ActivityStepRow(null, if (thinking) "Thinking…" else "$idleStatus…", inProgress = running)
                     }
-                    items.forEachIndexed { index, item ->
-                        ActivityStepRow(item, compactActivityText(item), inProgress = running && !item.isComplete && index == items.lastIndex)
+                    // Older saved chats may contain hundreds of polling steps. Rendering all of them
+                    // in one lazy-list item can monopolize the UI thread, so show the latest window.
+                    val visibleItems = items.takeLast(32)
+                    visibleItems.forEachIndexed { index, item ->
+                        ActivityStepRow(item, compactActivityText(item), inProgress = running && !item.isComplete && index == visibleItems.lastIndex)
                     }
                 }
             }
@@ -1506,7 +1526,7 @@ private fun activityIcon(item: ActivityItem?): ImageVector {
 }
 
 private fun compactActivityText(item: ActivityItem): String =
-    "${activityName(item)} · ${activityDetail(item).replace(Regex("\\s+"), " ").take(105)}"
+    "${activityName(item)} · ${activityDetail(item).take(180).replace(Regex("\\s+"), " ").take(105)}"
 
 private fun activityDetail(item: ActivityItem): String {
     if (item.title == "Think" && item.detail.contains("reasoning tokens processed", true)) {

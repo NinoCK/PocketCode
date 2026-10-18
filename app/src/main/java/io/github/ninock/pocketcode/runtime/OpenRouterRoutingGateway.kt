@@ -38,6 +38,7 @@ internal class OpenRouterRoutingGateway(
     private fun acceptLoop() {
         while (running.get()) {
             runCatching { server.accept() }.getOrNull()?.let { socket ->
+                runCatching { socket.soTimeout = 30_000 }
                 Thread({ socket.use(::handle) }, "mh-openrouter-request").apply { isDaemon = true; start() }
             }
         }
@@ -58,6 +59,10 @@ internal class OpenRouterRoutingGateway(
         }
         val length = headers["content-length"]?.toIntOrNull() ?: 0
         val output = BufferedOutputStream(socket.getOutputStream())
+        if (!isLoopbackRequestAuthorized(headers, apiKey)) {
+            writeJson(output, 401, errorJson("Missing or invalid credentials"))
+            return
+        }
         if (length !in 0..MAX_REQUEST_BYTES) {
             writeJson(output, 413, errorJson("Request is too large"))
             return

@@ -1,7 +1,13 @@
 package io.github.ninock.pocketcode.ui
 
+import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
+import androidx.core.content.FileProvider
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -23,6 +29,7 @@ import androidx.compose.material.icons.rounded.CreateNewFolder
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.FolderZip
 import androidx.compose.material.icons.rounded.Photo
+import androidx.compose.material.icons.rounded.PhotoCamera
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -72,13 +79,24 @@ private data class AttachSource(
     val onClick: () -> Unit,
 )
 
-/** What the composer's attach button offers: gallery images, any document, or a ZIP to extract. */
+/** Creates an empty file in the app cache for the camera app to write into, shared via FileProvider. */
+internal fun createCameraPhotoUri(context: Context): Uri {
+    val folder = File(context.cacheDir, "camera").apply { mkdirs() }
+    // Photos are copied into the project as attachments, so older captures are no longer needed.
+    val staleBefore = System.currentTimeMillis() - 60 * 60 * 1000L
+    folder.listFiles()?.filter { it.lastModified() < staleBefore }?.forEach { it.delete() }
+    val file = File(folder, "photo-${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())}.jpg")
+    return FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+}
+
+/** What the composer's attach button offers: gallery images, a camera photo, any document, or a ZIP to extract. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun AttachSourceSheet(
     canAddFiles: Boolean,
     onDismiss: () -> Unit,
     onPhotos: () -> Unit,
+    onCamera: () -> Unit,
     onFiles: () -> Unit,
     onZip: () -> Unit,
 ) {
@@ -92,6 +110,7 @@ internal fun AttachSourceSheet(
             val limitNote = "Attachment limit reached for this message"
             val sources = listOf(
                 AttachSource(Icons.Rounded.Photo, "Photos", if (canAddFiles) "Pick images from your gallery" else limitNote, canAddFiles, onPhotos),
+                AttachSource(Icons.Rounded.PhotoCamera, "Camera", if (canAddFiles) "Take a photo and attach it" else limitNote, canAddFiles, onCamera),
                 AttachSource(Icons.Rounded.Description, "Files", if (canAddFiles) "Any document from the system file picker" else limitNote, canAddFiles, onFiles),
                 AttachSource(Icons.Rounded.FolderZip, "ZIP archive", "Extract into this project or open as new", true, onZip),
             )

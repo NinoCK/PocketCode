@@ -408,6 +408,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     @Volatile private var lastOpenedClaudeAuthUrl: String? = null
     private var activeRuntimeRequest: RuntimeRetryRequest? = null
     private val failedApiKeyIds = mutableSetOf<String>()
+    // Writes are drained into a per-chat batch below so rapid activity frames do not
+    // serialize hundreds of obsolete snapshots.
     private val transcriptWrites = Channel<TranscriptWrite>(Channel.UNLIMITED)
     private val initialAgentKind = AgentKind.fromStored(preferences.agentKind)
     private val initialPrimaryAgentKind = preferences.primaryAgentKind
@@ -470,8 +472,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _state.update { it.copy(usageRecords = records + it.usageRecords) }
         }
         viewModelScope.launch(Dispatchers.IO) {
-            for (write in transcriptWrites) {
-                preferences.saveMessages(write.projectId, write.chatId, write.messages)
+            for (pending in transcriptWrites) {
+                delay(TRANSCRIPT_WRITE_DEBOUNCE_MS)
+                val latestByChat = linkedMapOf((pending.projectId to pending.chatId) to pending)
+                while (true) {
+                    val next = transcriptWrites.tryReceive().getOrNull() ?: break
+                    latestByChat[next.projectId to next.chatId] = next
+                }
+                latestByChat.values.forEach { latest ->
+                    preferences.saveMessages(latest.projectId, latest.chatId, latest.messages)
+                }
             }
         }
         viewModelScope.launch { dshRuntime.events.collect(::onRuntimeEvent) }
@@ -559,15 +569,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     val state: StateFlow<AppUiState> = _state.asStateFlow()
 
-    private val _terminalLines = MutableStateFlow<List<TerminalOutputLine>>(
-        listOf(
-            TerminalOutputLine(
-                command = "uname -a",
-                output = "Linux pocket-dev 6.1.0-arm64 #1 SMP aarch64 GNU/Linux (PRoot Sandbox)",
-                exitCode = 0,
-            ),
-        ),
-    )
+    private val _terminalLines = MutableStateFlow<List<TerminalOutputLine>>(emptyList())
     val terminalLines: StateFlow<List<TerminalOutputLine>> = _terminalLines.asStateFlow()
 
     private val _isTerminalRunning = MutableStateFlow(false)
@@ -4132,7 +4134,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun isNoisyRuntimeItem(item: ActivityItem): Boolean {
-        val combined = "${item.title} ${item.detail}"
+        // Never allocate or scan an entire command/result just to classify the row.
+        val combined = "${item.title} ${item.detail.take(NOISY_ITEM_SCAN_CHARS)}"
         return combined.contains("Starting Claude Code", true) ||
             combined.contains("Agent process started", true) ||
             combined.contains("Claude Code connected", true) ||
@@ -4145,7 +4148,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun finishWorkSegment(current: AppUiState, finishedAt: Long = System.currentTimeMillis()): AppUiState {
         val meaningfulItems = current.liveProcess.filterNot(::isNoisyRuntimeItem)
+            .map(::boundedActivityItem)
             .map { if (it.isComplete) it else it.copy(isComplete = true) }
+            .takeLast(MAX_VISIBLE_WORK_ITEMS)
         // Nothing the agent actually reported (e.g. a reply with no reasoning or tools): keep no work
         // block. The response bubble still carries the task duration.
         if (meaningfulItems.isEmpty()) {
@@ -4187,9 +4192,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun appendWorkItem(current: AppUiState, item: ActivityItem): AppUiState {
-        if (isNoisyRuntimeItem(item)) return current
+        val boundedItem = boundedActivityItem(item)
+        if (isNoisyRuntimeItem(boundedItem)) return current
         return current.copy(
-            liveProcess = current.liveProcess.map { if (!it.isComplete) it.copy(isComplete = true) else it } + item,
+            liveProcess = (current.liveProcess
+                .map { if (!it.isComplete) it.copy(isComplete = true) else it } + boundedItem)
+                .takeLast(MAX_VISIBLE_WORK_ITEMS),
             liveThinking = false,
             workSegmentStartedAtMillis = current.workSegmentStartedAtMillis ?: System.currentTimeMillis(),
         )
@@ -4267,13 +4275,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         },
                         liveThinking = false,
                         activeThinkingBlockId = null,
-                        activity = listOf(
+                        activity = (listOf(
                             ActivityItem("Running ${event.toolName}", event.detail, false, isCommand = event.toolName == "Bash"),
-                        ) + current.activity.map { if (!it.isComplete) it.copy(isComplete = true) else it },
+                        ) + current.activity.map { if (!it.isComplete) it.copy(isComplete = true) else it })
+                            .take(MAX_VISIBLE_WORK_ITEMS),
                     )
                     appendWorkItem(
                         planned,
                         ActivityItem("Running ${event.toolName}", event.detail, false, isCommand = event.toolName == "Bash"),
+                    )
+                }
+                is RuntimeEvent.ToolProgress -> {
+                    val runningIndex = current.liveProcess.indexOfLast {
+                        !it.isComplete && it.title == "Running ${event.toolName}"
+                    }
+                    if (runningIndex < 0) current else current.copy(
+                        liveProcess = current.liveProcess.toMutableList().also { items ->
+                            items[runningIndex] = boundedActivityItem(
+                                items[runningIndex].copy(detail = event.detail),
+                            )
+                        },
                     )
                 }
                 is RuntimeEvent.RuntimeLog -> appendWorkItem(
@@ -4318,18 +4339,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                                 "${event.toolName} completed",
                                 runningItem.detail.ifBlank { event.summary },
                                 isCommand = event.toolName == "Bash",
-                            )
+                            ).let(::boundedActivityItem)
                         }
                     } else {
-                        current.liveProcess + ActivityItem(
+                        current.liveProcess + boundedActivityItem(ActivityItem(
                             "${event.toolName} completed",
                             event.summary,
                             isCommand = event.toolName == "Bash",
-                        )
+                        ))
                     }
                     current.copy(
-                        activity = listOf(ActivityItem(event.summary, event.toolName)) + current.activity,
-                        liveProcess = process,
+                        activity = (listOf(ActivityItem(event.summary, event.toolName)) + current.activity)
+                            .take(MAX_VISIBLE_WORK_ITEMS),
+                        liveProcess = process.takeLast(MAX_VISIBLE_WORK_ITEMS),
                         liveThinking = false,
                         workSegmentStartedAtMillis = current.workSegmentStartedAtMillis ?: System.currentTimeMillis(),
                     )
@@ -4522,7 +4544,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val current = _state.value
         val project = current.activeProject ?: return
         val chatId = current.activeChatId ?: return
-        val liveItems = if (includeLiveProcess) current.liveProcess.filterNot(::isNoisyRuntimeItem) else emptyList()
+        val liveItems = if (includeLiveProcess) {
+            current.liveProcess.takeLast(MAX_VISIBLE_WORK_ITEMS)
+                .map(::boundedActivityItem)
+                .filterNot(::isNoisyRuntimeItem)
+        } else {
+            emptyList()
+        }
         val messages = if (liveItems.isEmpty() && !current.liveThinking && !current.awaitingAgent) {
             current.messages
         } else {
@@ -4539,6 +4567,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         transcriptWrites.trySend(TranscriptWrite(project.id, chatId, messages))
+    }
+
+    private fun boundedActivityItem(item: ActivityItem): ActivityItem {
+        if (item.detail.length <= MAX_ACTIVITY_DETAIL_CHARS) return item
+        return item.copy(
+            detail = "… Earlier output omitted …\n" + item.detail.takeLast(MAX_ACTIVITY_DETAIL_CHARS),
+        )
+    }
+
+    /** Drops only rebuildable or already-persisted data when Android reports memory pressure. */
+    fun releaseMemoryCaches() {
+        _state.update { current ->
+            current.copy(
+                projectTerminalLines = current.projectTerminalLines.takeLast(MEMORY_PRESSURE_TERMINAL_LINES),
+                projectTerminalLiveOutput = current.projectTerminalLiveOutput.takeLast(MEMORY_PRESSURE_TEXT_CHARS),
+            )
+        }
     }
 
     private fun updateActiveChatTitle(prompt: String) {
@@ -4563,6 +4608,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     companion object {
+        /** A long-running agent can poll a managed command hundreds of times. Keep the chat
+         * responsive by retaining the latest useful steps instead of composing an unbounded list. */
+        private const val MAX_VISIBLE_WORK_ITEMS = 32
+        private const val MAX_ACTIVITY_DETAIL_CHARS = 8_000
+        private const val NOISY_ITEM_SCAN_CHARS = 320
+        private const val TRANSCRIPT_WRITE_DEBOUNCE_MS = 500L
+        private const val MEMORY_PRESSURE_TERMINAL_LINES = 20
+        private const val MEMORY_PRESSURE_TEXT_CHARS = 64 * 1024
         private const val MINIMUM_INITIALIZATION_SCREEN_MS = 3_000L
         private const val EXPORT_PROGRESS_INTERVAL_MS = 80L
         private const val MAX_PROJECT_TERMINAL_HISTORY = 100

@@ -1489,7 +1489,8 @@ private fun ProviderCredentialsStep(
     var statusDetails by remember { mutableStateOf<String?>(null) }
     var statusOk by remember { mutableStateOf(false) }
     var showModels by rememberSaveable { mutableStateOf(false) }
-    val hasKey = apiKey.isNotBlank() || hasStoredSecret
+    // Custom API servers that are self-hosted (llama.cpp, LM Studio, Ollama) often need no key.
+    val hasKey = apiKey.isNotBlank() || hasStoredSecret || provider == ProviderKind.CUSTOM
 
     fun discoverModels(openWhenReady: Boolean = true) {
         scope.launch {

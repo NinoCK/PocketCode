@@ -93,6 +93,7 @@ class RuntimeExecutionService : Service() {
             .setOnlyAlertOnce(true)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
         if (includeStop) {
             val stopIntent = PendingIntent.getService(
                 this,

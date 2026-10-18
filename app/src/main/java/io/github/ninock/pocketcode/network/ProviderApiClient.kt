@@ -77,8 +77,8 @@ class ProviderApiClient {
         openRouterProviderOrder: String = "",
         openRouterAllowFallbacks: Boolean = true,
     ): ConnectionValidation = withContext(Dispatchers.IO) {
-        if (baseUrl.isBlank() || model.isBlank() || apiKey.isBlank()) {
-            return@withContext ConnectionValidation.Failure("Base URL, model, and API key are required.")
+        if (baseUrl.isBlank() || model.isBlank()) {
+            return@withContext ConnectionValidation.Failure("Base URL and model are required.")
         }
         val endpoint = messagesEndpoint(baseUrl, protocol)
         val body = validationBody(model, protocol, openRouterProviderOrder, openRouterAllowFallbacks)
@@ -145,6 +145,9 @@ class ProviderApiClient {
         connectTimeoutMs: Int = 12_000,
         readTimeoutMs: Int = 20_000,
     ): HttpResult {
+        if (!LocalNetwork.isPlainHttpAllowed(endpoint)) {
+            return HttpResult(0, "", "Plain http:// is only allowed for local network addresses (like 192.168.x.x, 10.x.x.x, Tailscale or .local). Use https:// for this server.")
+        }
         return runCatching {
             val connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
                 requestMethod = method
@@ -169,7 +172,16 @@ class ProviderApiClient {
             if (body != null) connection.outputStream.use { it.write(body.toByteArray()) }
             val code = connection.responseCode
             val stream = if (code in 200..299) connection.inputStream else connection.errorStream
-            val responseBody = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
+            val responseBody = stream?.bufferedReader()?.use { reader ->
+                buildString {
+                    val buffer = CharArray(8 * 1024)
+                    while (length < MAX_PROVIDER_RESPONSE_CHARS) {
+                        val count = reader.read(buffer, 0, minOf(buffer.size, MAX_PROVIDER_RESPONSE_CHARS - length))
+                        if (count <= 0) break
+                        append(buffer, 0, count)
+                    }
+                }
+            }.orEmpty()
             connection.disconnect()
             HttpResult(code, responseBody)
         }.getOrElse { HttpResult(0, "", it.message ?: "Network connection failed",) }
@@ -228,12 +240,12 @@ class ProviderApiClient {
             .toString()
         ProviderProtocol.OPENAI_CHAT -> JSONObject()
             .put("model", model)
-            .put("max_tokens", 1)
+            .put("max_tokens", VALIDATION_MAX_TOKENS)
             .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", "Reply OK")))
             .toString()
         else -> JSONObject()
             .put("model", model)
-            .put("max_tokens", 1)
+            .put("max_tokens", VALIDATION_MAX_TOKENS)
             .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", "Reply OK")))
             .also { body ->
                 val providers = openRouterProviderOrder.split(',')
@@ -278,6 +290,13 @@ class ProviderApiClient {
     }
 
     private data class HttpResult(val code: Int, val body: String, val error: String? = null)
+
+    private companion object {
+        // Some OpenAI-compatible providers reject values below three. Eight remains
+        // small while working across OpenAI chat, Anthropic-compatible and router APIs.
+        const val VALIDATION_MAX_TOKENS = 8
+        const val MAX_PROVIDER_RESPONSE_CHARS = 2 * 1024 * 1024
+    }
 }
 
 object ModelResponseParser {

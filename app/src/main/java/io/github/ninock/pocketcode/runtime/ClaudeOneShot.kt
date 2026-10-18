@@ -29,7 +29,7 @@ class ClaudeOneShot(
     fun unavailableReason(provider: ProviderProfile): String? = when {
         !installer.isAgentInstalled(AgentKind.CLAUDE_CODE) -> "Drafting uses Claude Code. Install it from Settings first."
         provider.kind == ProviderKind.OPENCODE_ZEN -> "Drafting isn't available with OpenCode Zen. Pick another provider in Settings."
-        secretFor(provider).isNullOrBlank() -> if (provider.kind == ProviderKind.CLAUDE) "Sign in to Claude in Settings first." else "Add an API key for ${provider.kind.title} in Settings first."
+        secretFor(provider).isNullOrBlank() && localServerPlaceholderKey(provider).isBlank() -> if (provider.kind == ProviderKind.CLAUDE) "Sign in to Claude in Settings first." else "Add an API key for ${provider.kind.title} in Settings first."
         else -> null
     }
 
@@ -45,7 +45,7 @@ class ClaudeOneShot(
         input: String,
     ): OneShotResult = withContext(Dispatchers.IO) {
         unavailableReason(provider)?.let { error(it) }
-        val secret = secretFor(provider).orEmpty()
+        val secret = secretFor(provider).orEmpty().ifBlank { localServerPlaceholderKey(provider) }
         val subscription = provider.kind.protocol == ProviderProtocol.CLAUDE_LOGIN
         val formatGateway = if (provider.kind.protocol == ProviderProtocol.OPENAI_CHAT || provider.kind.protocol == ProviderProtocol.OPENAI_RESPONSES) {
             LocalFormatGateway(provider, secret).start()
