@@ -340,6 +340,19 @@ adb install -r app/build/outputs/apk/online/debug/app-online-debug.apk
 
 The Offline edition (`assembleOfflineDebug`) also needs the runtime bundles in `dist/runtime-bundles/`.
 
+### Signed release APK
+Release builds are signed when a keystore is configured, either through the `MH_UPLOAD_STORE_FILE`, `MH_UPLOAD_STORE_PASSWORD`, `MH_UPLOAD_KEY_ALIAS` and `MH_UPLOAD_KEY_PASSWORD` environment variables or through a git-ignored `signing.properties` file in the project root:
+```properties
+storeFile=/absolute/path/to/release.jks
+keyAlias=pocketcode
+storePassword=…
+keyPassword=…
+```
+```bash
+./gradlew assembleOnlineRelease
+```
+Without signing settings the build produces `app-online-release-unsigned.apk`. Every update must be signed with the same key, so keep the keystore and its password backed up.
+
 ### Tests and lint
 ```bash
 ./gradlew testOnlineDebugUnitTest

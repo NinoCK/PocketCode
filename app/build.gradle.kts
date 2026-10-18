@@ -15,10 +15,20 @@ val playBuild = providers.gradleProperty("playBuild").orNull?.toBoolean() == tru
     providers.gradleProperty("playFeasibility").orNull?.toBoolean() == true
 val privacyPolicyUrl = providers.gradleProperty("privacyPolicyUrl").orNull
     ?: "https://github.com/NinoCK/PocketCode/blob/main/PRIVACY.md"
-val uploadStorePath = providers.environmentVariable("MH_UPLOAD_STORE_FILE").orNull
-val uploadStorePassword = providers.environmentVariable("MH_UPLOAD_STORE_PASSWORD").orNull
-val uploadKeyAlias = providers.environmentVariable("MH_UPLOAD_KEY_ALIAS").orNull
-val uploadKeyPassword = providers.environmentVariable("MH_UPLOAD_KEY_PASSWORD").orNull
+// Release signing comes from MH_UPLOAD_* environment variables, or from the git-ignored
+// signing.properties next to settings.gradle.kts. Without either, release APKs are unsigned
+// (F-Droid signs its own builds).
+val signingProperties = Properties().apply {
+    val signingFile = rootProject.file("signing.properties")
+    if (signingFile.isFile) signingFile.inputStream().use(::load)
+}
+fun signingValue(environmentName: String, propertyName: String): String? =
+    providers.environmentVariable(environmentName).orNull
+        ?: signingProperties.getProperty(propertyName)?.takeIf(String::isNotBlank)
+val uploadStorePath = signingValue("MH_UPLOAD_STORE_FILE", "storeFile")
+val uploadStorePassword = signingValue("MH_UPLOAD_STORE_PASSWORD", "storePassword")
+val uploadKeyAlias = signingValue("MH_UPLOAD_KEY_ALIAS", "keyAlias")
+val uploadKeyPassword = signingValue("MH_UPLOAD_KEY_PASSWORD", "keyPassword")
 val hasUploadSigning = listOf(
     uploadStorePath,
     uploadStorePassword,
