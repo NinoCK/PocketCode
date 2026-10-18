@@ -1,0 +1,9 @@
+- New app ID (io.github.ninock.pocketcode): install fresh, it no longer replaces Mobile Harness
+- Updates and Linux runtime downloads now come from the PocketCode repository
+- Claude sign-in opens in your default browser
+- Self-hosted model servers: plain http:// on LAN/Tailscale, API key optional for Custom API
+- Attach a camera photo to a chat message
+- Safer runtime repair that keeps the Linux home folder
+- Local agent gateways only accept the configured key
+- Fewer freezes and lower memory use during long agent runs
+- More reliable DeepSeek Harness and Antigravity task completion

@@ -2,7 +2,6 @@ package io.github.ninock.pocketcode.ui
 
 import android.app.Application
 import android.content.Intent
-import androidx.browser.customtabs.CustomTabsIntent
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
@@ -1917,18 +1916,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Opens Claude sign-in in a Custom Tab (an in-app browser sheet backed by
-     * the user's browser). Unlike a WebView it can use existing sessions and
-     * Google sign-in, and it follows the redirect to Claude Code's localhost
-     * listener.
+     * Opens Claude sign-in in the user's default browser. A Custom Tab could not
+     * reach the authorize page after logging in to claude.ai, while the full
+     * browser completes the flow and follows the redirect to Claude Code's
+     * localhost listener.
      */
-    private fun openSignInPage(url: String) {
-        runCatching {
-            val tab = CustomTabsIntent.Builder().setShowTitle(true).build()
-            tab.intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            tab.launchUrl(getApplication(), Uri.parse(url))
-        }.onFailure { openExternalUrl(url) }
-    }
+    private fun openSignInPage(url: String) = openExternalUrl(url)
 
     fun submitClaudeAuthCode(code: String) {
         viewModelScope.launch {
