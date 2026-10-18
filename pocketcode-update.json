@@ -1,0 +1,12 @@
+{
+  "versionCode": 6,
+  "versionName": "1.1.0",
+  "notes": "New app ID, Claude sign-in in your default browser, self-hosted model servers, camera attachments, safer runtime repair, locked-down local gateways, and stability fixes for long agent runs.",
+  "artifacts": {
+    "online": {
+      "url": "https://github.com/NinoCK/PocketCode/releases/download/v1.1.0/PocketCode.apk",
+      "sha256": "6dca5577a19cd371bc5d7094e9f403372d847c117e21df8e67df49ca62e377c4",
+      "sizeBytes": 54024621
+    }
+  }
+}

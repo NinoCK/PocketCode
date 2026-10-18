@@ -1,0 +1,7 @@
+First PocketCode release:
+- Material 3 Expressive redesign with wallpaper colors and automatic dark/light theme
+- Code editor with syntax highlighting, find & replace and a coding key row
+- File management: upload, create, rename, delete, and ZIP import/export
+- Sign in with a Claude subscription, no API key needed
+- New welcome and setup flow
+- Agent sessions keep running in the background

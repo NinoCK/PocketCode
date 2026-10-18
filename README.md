@@ -235,7 +235,7 @@ PocketCode uses Claude Code's Anthropic-compatible API protocol. You can connect
 | **DeepSeek Harness** | API-key providers | On demand | Its own bridge and settings |
 | **Antigravity CLI** | Official Google OAuth flow | Version-pinned download | Its own `agy` bridge, model, effort and conversation IDs |
 
-**Claude subscription.** Choose **Claude subscription** and tap **Sign in with Claude**. PocketCode runs the official `claude setup-token` command on the phone and opens the sign-in page in an in-app browser tab (Chrome Custom Tab). Once you approve, claude.ai redirects back to Claude Code's own listener on `127.0.0.1`. Claude Code then creates a one-year subscription token, which PocketCode stores with Android Keystore encryption. If the browser can't return to the app, tap **Sign in with a code instead** and paste the code from the Claude page. You can also paste a token you made with `claude setup-token` on another computer.
+**Claude subscription.** Choose **Claude subscription** and tap **Sign in with Claude**. PocketCode runs the official `claude setup-token` command on the phone and opens the sign-in page in your default browser. Once you approve, claude.ai redirects back to Claude Code's own listener on `127.0.0.1`. Claude Code then creates a one-year subscription token, which PocketCode stores with Android Keystore encryption. If the browser can't return to the app, tap **Sign in with a code instead** and paste the code from the Claude page. You can also paste a token you made with `claude setup-token` on another computer.
 
 **Antigravity.** Select **Antigravity CLI**, install it, and tap **Sign in with Google**. PocketCode starts the official CLI login, opens the Google URL it generates in your system browser, and passes the one-time code back to the waiting process. Google login is never embedded in a WebView, and PocketCode never builds its own OAuth request.
 
@@ -340,6 +340,19 @@ adb install -r app/build/outputs/apk/online/debug/app-online-debug.apk
 
 The Offline edition (`assembleOfflineDebug`) also needs the runtime bundles in `dist/runtime-bundles/`.
 
+### Signed release APK
+Release builds are signed when a keystore is configured, either through the `MH_UPLOAD_STORE_FILE`, `MH_UPLOAD_STORE_PASSWORD`, `MH_UPLOAD_KEY_ALIAS` and `MH_UPLOAD_KEY_PASSWORD` environment variables or through a git-ignored `signing.properties` file in the project root:
+```properties
+storeFile=/absolute/path/to/release.jks
+keyAlias=pocketcode
+storePassword=…
+keyPassword=…
+```
+```bash
+./gradlew assembleOnlineRelease
+```
+Without signing settings the build produces `app-online-release-unsigned.apk`. Every update must be signed with the same key, so keep the keystore and its password backed up.
+
 ### Tests and lint
 ```bash
 ./gradlew testOnlineDebugUnitTest
@@ -349,9 +362,9 @@ The Offline edition (`assembleOfflineDebug`) also needs the runtime bundles in `
 ### UI gallery
 Debug builds include a screen gallery that renders every screen with sample data, with no Linux runtime needed. The screenshots in this README come from it:
 ```bash
-adb shell am start -n com.jarves.mh/.ui.UiGalleryActivity --es screen projects --es theme dark
+adb shell am start -n io.github.ninock.pocketcode/.ui.UiGalleryActivity --es screen projects --es theme dark
 ```
-See `app/src/debug/java/com/jarves/mh/ui/UiGalleryActivity.kt` for the list of screens.
+See `app/src/debug/java/io/github/ninock/pocketcode/ui/UiGalleryActivity.kt` for the list of screens.
 
 ### Build targets
 * **Direct APK** (default): targets API 28 to keep the proven userspace execution paths working on Android 10–14.
@@ -387,7 +400,7 @@ Developer packs download on demand to save space:
 ```text
 PocketCode/
 ├── app/src/main/
-│   ├── java/com/jarves/mh/
+│   ├── java/io/github/ninock/pocketcode/
 │   │   ├── data/       # Preferences, Keystore encryption, persistence
 │   │   ├── model/      # Projects, chats, files, tool calls
 │   │   ├── runtime/    # PRoot installer, agent bridges, foreground services

@@ -14,11 +14,21 @@ val testSecrets = Properties().apply {
 val playBuild = providers.gradleProperty("playBuild").orNull?.toBoolean() == true ||
     providers.gradleProperty("playFeasibility").orNull?.toBoolean() == true
 val privacyPolicyUrl = providers.gradleProperty("privacyPolicyUrl").orNull
-    ?: "https://github.com/techjarves/Mobile-Harness/blob/main/PRIVACY.md"
-val uploadStorePath = providers.environmentVariable("MH_UPLOAD_STORE_FILE").orNull
-val uploadStorePassword = providers.environmentVariable("MH_UPLOAD_STORE_PASSWORD").orNull
-val uploadKeyAlias = providers.environmentVariable("MH_UPLOAD_KEY_ALIAS").orNull
-val uploadKeyPassword = providers.environmentVariable("MH_UPLOAD_KEY_PASSWORD").orNull
+    ?: "https://github.com/NinoCK/PocketCode/blob/main/PRIVACY.md"
+// Release signing comes from MH_UPLOAD_* environment variables, or from the git-ignored
+// signing.properties next to settings.gradle.kts. Without either, release APKs are unsigned
+// (F-Droid signs its own builds).
+val signingProperties = Properties().apply {
+    val signingFile = rootProject.file("signing.properties")
+    if (signingFile.isFile) signingFile.inputStream().use(::load)
+}
+fun signingValue(environmentName: String, propertyName: String): String? =
+    providers.environmentVariable(environmentName).orNull
+        ?: signingProperties.getProperty(propertyName)?.takeIf(String::isNotBlank)
+val uploadStorePath = signingValue("MH_UPLOAD_STORE_FILE", "storeFile")
+val uploadStorePassword = signingValue("MH_UPLOAD_STORE_PASSWORD", "storePassword")
+val uploadKeyAlias = signingValue("MH_UPLOAD_KEY_ALIAS", "keyAlias")
+val uploadKeyPassword = signingValue("MH_UPLOAD_KEY_PASSWORD", "keyPassword")
 val hasUploadSigning = listOf(
     uploadStorePath,
     uploadStorePassword,
@@ -26,9 +36,9 @@ val hasUploadSigning = listOf(
     uploadKeyPassword,
 ).all { !it.isNullOrBlank() }
 val runtimeReleaseBaseUrl =
-    "https://github.com/techjarves/Mobile-Harness/releases/download/runtime-2026.09.4"
+    "https://github.com/NinoCK/PocketCode/releases/download/runtime-2026.09.4"
 val appUpdateManifestUrl =
-    "https://github.com/techjarves/Mobile-Harness/releases/latest/download/mobile-harness-update.json"
+    "https://github.com/NinoCK/PocketCode/releases/latest/download/pocketcode-update.json"
 val runtimeBundleDir = rootProject.layout.projectDirectory.dir("dist/runtime-bundles")
 val generatedRuntimeAssets = layout.buildDirectory.dir("generated/runtime-assets")
 
@@ -52,7 +62,7 @@ fun buildConfigString(value: String): String =
     "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
 
 android {
-    namespace = "com.jarves.mh"
+    namespace = "io.github.ninock.pocketcode"
     compileSdk = 36
     // F-Droid's r26b recipe installs 26.1.10909125. Keep AGP from selecting
     // its newer default NDK; local developers may override this explicitly.
@@ -70,15 +80,15 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.jarves.mh"
+        applicationId = "io.github.ninock.pocketcode"
         minSdk = 28
         // The direct APK retains the proven target-28 PRoot execution path. The
         // Play build targets current Android while its runtime path is validated.
         targetSdk = if (playBuild) 36 else 28
         // Keep literal defaults so F-Droid's static manifest parser can detect
         // the tagged release. Gradle properties may still override Play builds.
-        versionCode = 5
-        versionName = "1.0.4"
+        versionCode = 6
+        versionName = "1.1.0"
         providers.gradleProperty("appVersionCode").orNull?.toIntOrNull()?.let { versionCode = it }
         providers.gradleProperty("appVersionName").orNull?.let { versionName = it }
 
@@ -172,7 +182,7 @@ tasks.matching { it.name.contains("Offline") && it.name.contains("lint", ignoreC
 
 tasks.register("playReadinessCheck") {
     group = "verification"
-    description = "Checks configuration required before uploading a Mobile Harness Play bundle."
+    description = "Checks configuration required before uploading a PocketCode Play bundle."
     doLast {
         check(playBuild) { "Run with -PplayBuild=true." }
         check(privacyPolicyUrl.startsWith("https://")) {
@@ -187,7 +197,6 @@ tasks.register("playReadinessCheck") {
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2026.06.01"))
     implementation("androidx.core:core-ktx:1.15.0")
-    implementation("androidx.browser:browser:1.8.0")
     implementation("androidx.activity:activity-compose:1.10.0")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
