@@ -1,1 +1,1 @@
-# Mobile Harness alpha: release shrinking is intentionally disabled.
+# PocketCode: release shrinking is intentionally disabled.

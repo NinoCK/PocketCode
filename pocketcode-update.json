@@ -1,0 +1,12 @@
+{
+  "versionCode": 5,
+  "versionName": "1.0.4",
+  "notes": "The first release of PocketCode.",
+  "artifacts": {
+    "online": {
+      "url": "https://github.com/NinoCK/PocketCode/releases/download/v1.0.4/PocketCode.apk",
+      "sha256": "f0f4d8adde89bd80652904efdf8afe25c41e9e0476a690a6def27e0d27d9c0a0",
+      "sizeBytes": 74905208
+    }
+  }
+}

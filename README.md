@@ -349,9 +349,9 @@ The Offline edition (`assembleOfflineDebug`) also needs the runtime bundles in `
 ### UI gallery
 Debug builds include a screen gallery that renders every screen with sample data, with no Linux runtime needed. The screenshots in this README come from it:
 ```bash
-adb shell am start -n com.jarves.mh/.ui.UiGalleryActivity --es screen projects --es theme dark
+adb shell am start -n io.github.ninock.pocketcode/.ui.UiGalleryActivity --es screen projects --es theme dark
 ```
-See `app/src/debug/java/com/jarves/mh/ui/UiGalleryActivity.kt` for the list of screens.
+See `app/src/debug/java/io/github/ninock/pocketcode/ui/UiGalleryActivity.kt` for the list of screens.
 
 ### Build targets
 * **Direct APK** (default): targets API 28 to keep the proven userspace execution paths working on Android 10–14.
@@ -387,7 +387,7 @@ Developer packs download on demand to save space:
 ```text
 PocketCode/
 ├── app/src/main/
-│   ├── java/com/jarves/mh/
+│   ├── java/io/github/ninock/pocketcode/
 │   │   ├── data/       # Preferences, Keystore encryption, persistence
 │   │   ├── model/      # Projects, chats, files, tool calls
 │   │   ├── runtime/    # PRoot installer, agent bridges, foreground services
